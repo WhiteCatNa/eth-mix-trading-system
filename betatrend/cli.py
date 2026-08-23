@@ -86,11 +86,18 @@ def cmd_train_nn(args) -> int:
     table = Table(title="ETH decision net — walk-forward OOS")
     table.add_column("metric")
     table.add_column("neural", justify="right")
-    nn_m = result.metrics["oos_neural"]
-    for k in ("sharpe", "total_return", "max_drawdown", "turnover"):
-        nv = nn_m[k]
-        if k in ("total_return", "max_drawdown"):
+    nn_m = result.metrics.get("oos_neural") or result.metrics["oos_neural"]
+    primary = result.metrics.get("eval_primary") or result.metrics.get("eval_primary") or {}
+    for k in ("sharpe", "max_drawdown", "calmar"):
+        nv = primary.get(k, nn_m.get(k))
+        if k == "max_drawdown":
             table.add_row(k, f"{nv:.2%}")
+        else:
+            table.add_row(k, f"{nv:.3f}")
+    for k in ("sortino", "total_return", "turnover"):
+        nv = nn_m[k]
+        if k == "total_return":
+            table.add_row(k + " (secondary)", f"{nv:.2%}")
         else:
             table.add_row(k, f"{nv:.3f}")
     table.add_row("folds", str(result.n_folds))
