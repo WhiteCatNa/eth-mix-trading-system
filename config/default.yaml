@@ -1,0 +1,80 @@
+# ETH 单币择时：拉行情 → 决策网 unit∈[-1,1] → 多空信号 → OMS
+# |unit| < 全仓 5% 则空仓、不开新单。回测 ≠ 实盘。
+
+account:
+  initial_capital: 100000.0
+  quote_currency: USDT
+  mode: paper   # research | paper | testnet | live
+
+universe:
+  symbol: ETHUSDT
+
+binance:
+  futures_base: https://fapi.binance.com
+  spot_base: https://api.binance.com
+  testnet_futures_base: https://testnet.binancefuture.com
+  testnet_spot_base: https://testnet.binance.vision
+  recv_window: 5000
+
+data:
+  cache_dir: data/cache
+  kline_interval: 1h
+  lookback_days: 500
+  funding_interval_hours: 8
+
+fees:
+  maker: 0.0002
+  taker: 0.0005
+  use_maker_for_entries: true
+
+slippage:
+  market_bps: 1.5
+
+strategy:
+  enabled: true
+  lookbacks_hours: [24, 72, 168]
+  lookback_weights: [0.25, 0.40, 0.35]
+  skip_hours: 0
+  vol_lookback: 72
+  target_vol_annual: 0.20
+  max_leverage: 2.0
+  risk_budget: 1.0
+  score_scale: 1.0
+  min_position: 0.05
+  long_only: false
+  rebalance_hours: 8
+  min_history: 360
+  decision: rl
+  nn_blend: 1.0
+  nn_smooth: 0.20
+  nn_model_path: models/eth_decision.pt
+  nn_hidden: [64, 32]
+  nn_dropout: 0.25
+  nn_seeds: 3
+  nn_cost_bps: 8.0
+  nn_epochs: 80
+  nn_patience: 12
+  nn_delta_gain: 0.5
+
+backtest:
+  warmup_bars: 400
+  report_dir: reports
+  turnover_band_equity: 0.015
+
+paper:
+  rebalance_minutes: 60
+  dry_run: true
+  state_file: data/state/paper.json
+  lookback_days: 400
+  max_notional_per_symbol: 100000
+
+oms:
+  min_notional: 10.0
+  client_id_prefix: bt
+  testnet_only: true
+  reconcile_qty_tol: 0.001
+
+logging:
+  level: INFO
+  file: logs/betatrend.log
+  audit_file: logs/audit.jsonl
