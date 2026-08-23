@@ -82,7 +82,9 @@ def _rollout(
     windows: np.ndarray,
     y: np.ndarray,
     lev: np.ndarray,
+    vol_ann: np.ndarray,
     cost: float,
+    cfg: StrategyCfg,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     net.eval()
     t_len = len(windows)
@@ -96,26 +98,31 @@ def _rollout(
         actions[sl] = a.cpu().numpy()
         logps[sl] = lp.cpu().numpy()
         values[sl] = v.cpu().numpy()
-    exposure = actions * lev.astype(np.float64)
-    dlt = np.empty_like(exposure)
-    dlt[0] = np.abs(exposure[0])
-    dlt[1:] = np.abs(np.diff(exposure))
-    rewards = (REWARD_SCALE * (exposure * y - cost * dlt)).astype(np.float32)
+    pnl = bar_pnl(actions, y, lev, cost)
+    rewards = shape_rewards(
+        pnl,
+        vol_ann,
+        eta=float(cfg.reward_ds_eta),
+        dd_inc=float(cfg.reward_dd_inc),
+        dd_level=float(cfg.reward_dd_level),
+        clip=float(cfg.reward_clip),
+    )
     return actions, logps, values, rewards
 
 
 def _ppo_update(
     net: PPOActorCritic,
     opt: torch.optim.Optimizer,
-    windows: np.ndarray,
-    actions: np.ndarray,
-    old_logp: np.ndarray,
-    advantages: np.ndarray,
-    returns: np.ndarray,
+    packed: dict[str, np.ndarray],
     cfg: StrategyCfg,
     inner_epochs: int,
 ) -> None:
     net.train()
+    windows = packed["obs"]
+    actions = packed["actions"]
+    old_logp = packed["logp"]
+    advantages = packed["advantages"]
+    returns = packed["returns"]
     t_len = len(windows)
     batch = min(max(int(cfg.ppo_batch), 16), max(t_len, 1))
     clip = float(cfg.ppo_clip)
@@ -149,6 +156,7 @@ def _train_one(
     windows: np.ndarray,
     y: np.ndarray,
     lev: np.ndarray,
+    vol_ann: np.ndarray,
     *,
     cfg: StrategyCfg,
     cost: float,
@@ -163,10 +171,12 @@ def _train_one(
     yc = np.clip(y, -y_clip, y_clip)
     inner = max(int(cfg.ppo_inner_epochs), 1)
     epochs = max(int(cfg.nn_epochs), 1)
+    replay = ReplayBuffer(n_rollouts=int(cfg.ppo_replay_rollouts))
     for _ in range(epochs):
-        actions, logps, values, rewards = _rollout(net, windows, yc, lev, cost)
+        actions, logps, values, rewards = _rollout(net, windows, yc, lev, vol_ann, cost, cfg)
         adv, ret = _gae(rewards, values, float(cfg.ppo_gamma), float(cfg.ppo_gae_lambda))
-        _ppo_update(net, opt, windows, actions, logps, adv, ret, cfg, inner)
+        replay.add(windows, actions, logps, adv, ret)
+        _ppo_update(net, opt, replay.packed(), cfg, inner)
     net.eval()
     return net
 
@@ -182,17 +192,27 @@ def _predict(net: PPOActorCritic, windows: np.ndarray) -> np.ndarray:
     return out
 
 
+def _finite(x: float, default: float = 0.0) -> float:
+    v = float(x)
+    return v if np.isfinite(v) else default
+
+
 def _overlay_metrics(y, pos, lev, cost, steps_per_year) -> dict:
+    """评估主指标是 Sharpe 与最大回撤；收益率只作次要参考。"""
     exp = pos * lev
     net = exp * y - cost * np.abs(np.diff(exp, prepend=exp[:1]))
     equity = np.cumprod(1.0 + net)
     eq = pd.Series(equity)
-    peak = eq.cummax()
-    dd = float(((eq - peak) / peak).min()) if len(eq) else 0.0
+    spy = int(round(steps_per_year))
+    mdd = float(max_drawdown(eq))
+    ann = float(annualized_return(eq, bars_per_year=spy))
     return {
-        "sharpe": float(sharpe_ratio(pd.Series(net), bars_per_year=int(round(steps_per_year)))),
+        "sharpe": _finite(sharpe_ratio(pd.Series(net), bars_per_year=spy)),
+        "max_drawdown": mdd,
+        "calmar": _finite(calmar_ratio(ann, mdd)),
+        "sortino": _finite(sortino_ratio(pd.Series(net), bars_per_year=spy)),
+        "annualized_return": ann,
         "total_return": float(equity[-1] - 1.0) if len(equity) else 0.0,
-        "max_drawdown": dd,
         "turnover": float(np.mean(np.abs(np.diff(exp, prepend=exp[:1])))),
         "mean_pos": float(np.mean(pos)),
     }
@@ -217,6 +237,7 @@ def train_decision_net(
     y_clip = 0.04
     feats = build_feature_frame(panel)
     y_all = execution_aligned_returns(panel).to_numpy(dtype=np.float64)
+    vol_all = feats["vol_24"].to_numpy(dtype=np.float64)
     lev_all = vol_leverage(feats["vol_24"], target=cfg.target_vol_annual, max_leverage=cfg.max_leverage).to_numpy(
         dtype=np.float64
     )
@@ -247,6 +268,7 @@ def train_decision_net(
                 win[tr_h],
                 y_all[tr_h],
                 lev_all[tr_h],
+                vol_all[tr_h],
                 cfg=cfg,
                 cost=cost,
                 seed=7 + seed + fold * 17,
@@ -278,6 +300,7 @@ def train_decision_net(
             win[tr_h],
             y_all[tr_h],
             lev_all[tr_h],
+            vol_all[tr_h],
             cfg=cfg,
             cost=cost,
             seed=101 + seed,
@@ -309,6 +332,17 @@ def train_decision_net(
     oos_df.to_parquet(oos_path)
     report = {
         "oos_neural": nn_m,
+        "eval_primary": {
+            "sharpe": nn_m["sharpe"],
+            "max_drawdown": nn_m["max_drawdown"],
+            "calmar": nn_m["calmar"],
+        },
+        "eval_secondary": {
+            "total_return": nn_m["total_return"],
+            "annualized_return": nn_m["annualized_return"],
+            "sortino": nn_m["sortino"],
+            "turnover": nn_m["turnover"],
+        },
         "horizon_hours": horizon,
         "n_folds": fold,
         "n_oos_bars": int(mask.sum()),
@@ -316,16 +350,20 @@ def train_decision_net(
         "oos_path": str(oos_path),
         "label": "hourly_ppo_from_next_open",
         "obs": f"[{seq_len}, {N_FEAT}]",
-        "note": "Walk-forward OOS for PPO actor (greedy). Position is the decision net only; no TSMOM residual.",
+        "note": (
+            "Walk-forward OOS for PPO actor (greedy). Primary eval is Sharpe and max drawdown, "
+            "not raw return. Position is the decision net only; no TSMOM residual."
+        ),
     }
     path.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     logger.info(
-        "PPO walk-forward | obs=[{},{}] Sharpe={:.2f} ret={:.2%} mdd={:.2%} | folds={}",
+        "PPO walk-forward | obs=[{},{}] Sharpe={:.2f} mdd={:.2%} calmar={:.2f} ret={:.2%} | folds={}",
         seq_len,
         N_FEAT,
         nn_m["sharpe"],
-        nn_m["total_return"],
         nn_m["max_drawdown"],
+        nn_m["calmar"],
+        nn_m["total_return"],
         fold,
     )
     return TrainResult(
