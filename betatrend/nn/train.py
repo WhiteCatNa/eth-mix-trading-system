@@ -1,7 +1,7 @@
 """Walk-forward PPO：观测是最近 7 根 bar 的 [7, 30] 窗口，Actor 输出仓位。
 
 关键约束：
-  - 逐步奖励用执行对齐 1h 收益（open[t+1] 成交、open[t+2] 平，与回测器一致）
+  - 逐步奖励：执行对齐 PnL → 波动标准化 → 差分夏普 − 回撤惩罚（对齐 Sharpe / 最大回撤）
   - 每折只在训练集上拟合 scaler，测试折绝不回头挑参
   - 损失 = clipped surrogate + value + entropy，没有 TSMOM 残差项
   - 全样本权重只在 walk-forward 报告过关后用于推理，OOS 数字才是诚实成绩
