@@ -58,6 +58,7 @@ def test_tiny_walk_forward_writes_weights(settings, tmp_path):
     settings.strategy.nn_seeds = 1
     settings.strategy.min_history = 80
     settings.strategy.ppo_inner_epochs = 1
+    settings.strategy.ppo_replay_rollouts = 2
     result = train_decision_net(
         panel,
         settings,
@@ -71,6 +72,11 @@ def test_tiny_walk_forward_writes_weights(settings, tmp_path):
     assert result.path.exists()
     assert result.n_folds >= 2
     assert np.isfinite(result.oos_sharpe)
+    assert np.isfinite(result.oos_max_dd)
+    assert result.oos_max_dd <= 1e-12
+    assert "eval_primary" in result.metrics
+    assert "sharpe" in result.metrics["eval_primary"]
+    assert "max_drawdown" in result.metrics["eval_primary"]
     policy = NeuralPolicy(settings)
     assert policy.ready
     unit = policy.predict_unit(panel)
@@ -123,3 +129,40 @@ def test_new_regime_features_are_present():
         assert name in FEATURE_NAMES
     assert "tsmom" not in FEATURE_NAMES
     assert len(FEATURE_NAMES) == 30
+
+
+def test_reward_shaping_penalizes_drawdown_more_than_flat():
+    from betatrend.nn.reward import bar_pnl, shape_rewards
+
+    n = 64
+    y = np.zeros(n)
+    y[20:28] = -0.02
+    lev = np.ones(n)
+    vol = np.full(n, 0.20)
+    crash = bar_pnl(np.ones(n), y, lev, cost=0.0)
+    flat = bar_pnl(np.zeros(n), y, lev, cost=0.0)
+    r_crash = shape_rewards(crash, vol)
+    r_flat = shape_rewards(flat, vol)
+    assert r_crash.mean() < r_flat.mean()
+    assert np.all(np.isfinite(r_crash))
+    assert r_crash.min() >= -5.0 - 1e-6
+
+
+def test_replay_buffer_keeps_recent_rollouts():
+    from betatrend.nn.buffer import ReplayBuffer
+
+    buf = ReplayBuffer(n_rollouts=2)
+    for i in range(3):
+        buf.add(
+            obs=np.ones((4, 7, 30), dtype=np.float32) * i,
+            actions=np.full(4, float(i), dtype=np.float32),
+            logp=np.zeros(4, dtype=np.float32),
+            advantages=np.ones(4, dtype=np.float32),
+            returns=np.ones(4, dtype=np.float32),
+        )
+    assert buf.n_stored == 2
+    packed = buf.packed()
+    assert packed["obs"].shape == (8, 7, 30)
+    assert packed["actions"].shape == (8,)
+    np.testing.assert_allclose(packed["actions"][:4], 1.0)
+    np.testing.assert_allclose(packed["actions"][4:], 2.0)
