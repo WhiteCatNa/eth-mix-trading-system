@@ -45,16 +45,29 @@ strategy:
   rebalance_hours: 8
   min_history: 360
   decision: rl
-  nn_blend: 1.0
   nn_smooth: 0.20
   nn_model_path: models/eth_decision.pt
-  nn_hidden: [64, 32]
-  nn_dropout: 0.25
+  nn_hidden: [128, 64]
+  nn_dropout: 0.2   # >0 启用 LSTM0.2 / FC0.3 / 分支0.2；输出头不加 dropout
   nn_seeds: 3
   nn_cost_bps: 8.0
   nn_epochs: 80
   nn_patience: 12
-  nn_delta_gain: 0.5
+  seq_len: 7
+  ppo_gamma: 0.99
+  ppo_gae_lambda: 0.95
+  ppo_clip: 0.2
+  ppo_ent_coef: 0.01
+  ppo_vf_coef: 0.5
+  ppo_lr: 0.0003
+  ppo_batch: 256
+  ppo_max_grad_norm: 0.5
+  ppo_inner_epochs: 4
+  ppo_replay_rollouts: 4
+  reward_ds_eta: 0.0139   # ≈ 1/72，差分夏普的滑动窗约 3 天
+  reward_dd_inc: 1.0      # 回撤加深惩罚
+  reward_dd_level: 0.05   # 停留在回撤里的持续惩罚
+  reward_clip: 5.0
 
 backtest:
   warmup_bars: 400

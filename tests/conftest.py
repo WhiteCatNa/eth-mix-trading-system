@@ -5,6 +5,22 @@ import pytest
 from betatrend.config import Settings, load_settings
 
 
+class FakePolicy:
+    """Deterministic unit for tests. Not a TSMOM stand-in — just a fixed RL output."""
+
+    ready = True
+
+    def __init__(self, settings=None, *, unit: float = 0.8):
+        self.settings = settings
+        self.unit = float(unit)
+
+    def reset(self) -> None:
+        pass
+
+    def predict_unit(self, panel, *args, **kwargs) -> float:
+        return self.unit
+
+
 @pytest.fixture
 def settings() -> Settings:
     return load_settings(
@@ -22,17 +38,16 @@ def settings() -> Settings:
                 "long_only": False,
                 "max_leverage": 2.0,
                 "target_vol_annual": 0.25,
-                "decision": "tsmom",
+                "decision": "rl",
             },
             "backtest": {"warmup_bars": 160, "turnover_band_equity": 0.01},
-            "risk": {
-                "vol_target_enabled": False,
-                "max_symbol_weight": 1.0,
-                "max_gross_leverage": 2.0,
-                "max_net_leverage": 2.0,
-                "drawdown_soft": 0.08,
-                "drawdown_hard": 0.14,
-                "drawdown_kill": 0.25,
-            },
         }
+    )
+
+
+@pytest.fixture
+def stub_rl(monkeypatch):
+    monkeypatch.setattr(
+        "betatrend.nn.policy.NeuralPolicy",
+        lambda settings: FakePolicy(settings, unit=0.8),
     )

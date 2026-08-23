@@ -1,14 +1,13 @@
 """决策网络的因果特征矩阵。第 t 行只用到 ≤ t 的信息，没有未来函数。
 
-``tsmom`` 必须放在最后一列：DecisionNet 从该列做残差跳跃，未训练时输出=TSMOM。
-滚动窗口全部 backward-looking（含当前 bar 收盘）。
+滚动窗口全部 backward-looking（含当前 bar 收盘）。仓位由决策网直接输出，
+这些列只是输入特征，不再包含 TSMOM 分数列。
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-# tsmom 必须留在最后：DecisionNet 对该列做残差 skip。
 # 含义简述：
 #   ret_*       多周期简单收益（1h / 4h / 12h / 1d / 3d / 7d）
 #   vol_*       实现波动（已年化）
@@ -19,12 +18,13 @@ import pandas as pd
 #   volx_z      成交量 z-score
 #   funding*    资金费率水平 / 均线 / z / 8h 差分（拥挤度）
 #   tod/dow     小时与星期的傅里叶编码
-#   ret_skip    经典 TSMOM skip：不含最近 24h 的 168h 收益
+#   ret_skip    不含最近 24h 的 168h 收益（减轻短期反转噪声）
 #   mom_agree   多周期动量符号一致性
 #   vov         波动的波动
 #   range_pos   价格在 24h 高低点中的位置
 #   ret_streak  同向收益持续长度
 #   trend_persist 收益一阶自相关
+#   close_z     24h 收盘价 z-score（把特征维补到 30，给 [7, 30] 窗口用）
 FEATURE_NAMES = [
     "ret_1",
     "ret_4",
@@ -55,12 +55,16 @@ FEATURE_NAMES = [
     "range_pos",
     "ret_streak",
     "trend_persist",
-    "tsmom",
+    "close_z",
 ]
 
-TSMOM_INDEX = FEATURE_NAMES.index("tsmom")
+SEQ_LEN = 7
+N_FEAT = len(FEATURE_NAMES)
 MAX_LOOKBACK = 168
 TAIL_BARS = MAX_LOOKBACK + 48
+
+if N_FEAT != 30:
+    raise RuntimeError(f"PPO observation is [7, 30]; got n_feat={N_FEAT}")
 
 
 def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
@@ -124,21 +128,39 @@ def build_feature_frame(panel: pd.DataFrame) -> pd.DataFrame:
     streak = ret.groupby(grp).cumcount() + 1
     out["ret_streak"] = (np.sign(ret) * np.log1p(streak)).fillna(0.0).clip(-4.0, 4.0)
     out["trend_persist"] = ret.rolling(24, min_periods=12).corr(ret.shift(1)).fillna(0.0).clip(-1.0, 1.0)
-    tsmom = 0.0
-    wsum = 0.0
-    for lb, w in zip((24, 72, 168), (0.25, 0.40, 0.35)):
-        r = close.pct_change(lb)
-        sig = ret.rolling(lb, min_periods=max(lb // 2, 8)).std().replace(0.0, np.nan)
-        tsmom = tsmom + w * (r / (sig * np.sqrt(lb)))
-        wsum += w
-    out["tsmom"] = (tsmom / wsum).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    ma = close.rolling(24, min_periods=8).mean()
+    sd = close.rolling(24, min_periods=8).std().replace(0.0, np.nan)
+    out["close_z"] = ((close - ma) / sd).fillna(0.0).clip(-5.0, 5.0)
     return out[FEATURE_NAMES].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+
+def make_windows(x: np.ndarray, seq_len: int = SEQ_LEN) -> np.ndarray:
+    """因果窗口：第 t 行是 [t-seq_len+1, t]；序列开头用第一行左填充。形状 (n, seq_len, n_feat)。"""
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim != 2:
+        raise ValueError(f"expected 2D features, got {x.shape}")
+    n, f = x.shape
+    if n == 0:
+        return np.zeros((0, seq_len, f), dtype=np.float32)
+    if seq_len <= 1:
+        return x[:, None, :]
+    pad = np.repeat(x[:1], seq_len - 1, axis=0)
+    xp = np.concatenate([pad, x], axis=0)
+    windows = np.lib.stride_tricks.sliding_window_view(xp, (seq_len, f))
+    return np.ascontiguousarray(windows[:, 0])
 
 
 def last_feature_row(panel: pd.DataFrame) -> np.ndarray:
     """最后一行因果特征。截一段足够长的尾巴，让 EMA/滚动窗口尽量贴近训练时的状态。"""
     tail = panel.iloc[-max(TAIL_BARS, 256) :] if len(panel) > TAIL_BARS else panel
     return build_feature_frame(tail).iloc[-1].to_numpy(dtype=np.float32)
+
+
+def last_feature_window(panel: pd.DataFrame, seq_len: int = SEQ_LEN) -> np.ndarray:
+    """最近 seq_len 根 bar 的因果特征，形状 (seq_len, n_feat)。"""
+    tail = panel.iloc[-max(TAIL_BARS, 256) :] if len(panel) > TAIL_BARS else panel
+    x = build_feature_frame(tail).to_numpy(dtype=np.float32)
+    return make_windows(x, seq_len=seq_len)[-1]
 
 
 def next_bar_returns(panel: pd.DataFrame) -> pd.Series:

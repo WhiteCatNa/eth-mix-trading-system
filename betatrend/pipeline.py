@@ -1,6 +1,6 @@
 """核心闭环：ETH 行情 → 决策网 → 多空信号 → OMS。
 
-    1. 特征（动量、波动）
+    1. 特征（实现波动，供反波动杠杆）
     2. 决策网输出 unit ∈ [-1, 1]（正多负空；|unit|<5% 不开仓）
     3. OMS 把目标名义拆成 BUY/SELL
     4. 执行由调用方完成（回测撮合 / paper）
@@ -45,9 +45,6 @@ class DeskCycle:
             snap.panels,
             snap.market_symbol,
             vol_lookback=self.settings.strategy.vol_lookback,
-            lookbacks=self.settings.strategy.lookbacks_hours,
-            weights=self.settings.strategy.lookback_weights,
-            skip_hours=self.settings.strategy.skip_hours,
         )
         targets = self.strategy.generate(snap, feat)
         notionals = {t.symbol: t.target_notional for t in targets}

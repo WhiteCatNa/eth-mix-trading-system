@@ -1,4 +1,4 @@
-"""仓位账本：永续数量、盯市、资金费、β/残差归因。
+"""仓位账本：永续数量、盯市、资金费、资金费。
 
 线性 USDT 本位合约：每根 bar 把价格变动立刻记进 cash（标记入账），
 因此 ``equity()`` 在正常路径下就等于 cash，不再另加未实现盈亏。
@@ -50,23 +50,3 @@ class Ledger:
         self.cash -= fill.fee + fill.slippage
         q = self.qty.get(fill.symbol, 0.0)
         self.qty[fill.symbol] = q + fill.qty_delta
-
-
-def split_beta_residual_pnl(
-    notionals: dict[str, float],
-    returns: dict[str, float],
-    betas: dict[str, float],
-    market_ret: float,
-) -> tuple[float, float]:
-    """把标的收益拆成 β 部分与残差：r ≈ β·r_m + ε，PnL ≈ 名义 × r。
-
-    单币且 market=trade 时残差应接近 0，β PnL ≈ 全部价格 PnL。
-    """
-    beta_pnl = 0.0
-    resid_pnl = 0.0
-    for s, n in notionals.items():
-        r = returns.get(s, 0.0)
-        b = betas.get(s, 1.0)
-        beta_pnl += n * b * market_ret
-        resid_pnl += n * (r - b * market_ret)
-    return beta_pnl, resid_pnl

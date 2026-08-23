@@ -80,8 +80,8 @@ class TargetPosition:
 
     target_notional：带符号的 USDT 名义本金（正=多，负=空）。
     signal：连续仓位 unit ∈ [-1, 1]，不是离散档位。
-    trend_score：原始 TSMOM 分数，供归因与日志。
-    extras：决策来源（tsmom/neural）、杠杆、波动率等调试字段。
+    trend_score：决策网 unit，供归因与日志。
+    extras：决策来源（rl/flat）、杠杆、波动率等调试字段。
     """
 
     symbol: str

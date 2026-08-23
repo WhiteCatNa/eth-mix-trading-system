@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "betatrend"
 version = "0.1.0"
-description = "Institutional beta-following trend desk for Binance USDT-M"
+description = "ETHUSDT timing: decision net → long/short signal → OMS"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
@@ -17,8 +17,6 @@ dependencies = [
   "pyarrow>=14",
   "loguru>=0.7",
   "rich>=13.7",
-  "plotly>=5.18",
-  "streamlit>=1.31",
 ]
 
 [project.optional-dependencies]

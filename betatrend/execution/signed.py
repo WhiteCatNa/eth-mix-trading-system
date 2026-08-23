@@ -1,7 +1,7 @@
-"""币安 USDT 本位永续的 HMAC 签名客户端。默认打 testnet，主网被控制面拦住。
+"""币安 USDT 本位永续的 HMAC 签名客户端。默认打 testnet。
 
 密钥只从环境变量读（BINANCE_API_KEY / SECRET），不写进 YAML。
-下单前必须经过 ControlPlane.assert_can_send_orders；account.mode=paper 时直接拒绝。
+paper/research 模式拒绝签名下单；oms.testnet_only 时禁止主网。
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ import httpx
 from loguru import logger
 
 from betatrend.config import Settings
-from betatrend.control import ControlPlane
 
 
 class BinanceSignedClient:
@@ -30,7 +29,6 @@ class BinanceSignedClient:
         self.key = os.environ.get("BINANCE_API_KEY", "")
         self.secret = os.environ.get("BINANCE_API_SECRET", "")
         self._http = httpx.Client(timeout=20.0, headers={"User-Agent": "BETA-TREND/0.1"})
-        self.control = ControlPlane(settings)
 
     def close(self) -> None:
         self._http.close()
@@ -69,9 +67,15 @@ class BinanceSignedClient:
         confirm: str = "",
         reduce_only: bool = False,
     ) -> dict:
-        self.control.assert_can_send_orders(confirm=confirm)
-        if self.settings.account.mode == "paper":
+        if self.settings.account.mode in ("research", "paper"):
             raise RuntimeError("Signed client refused: account.mode is paper")
+        if not self.testnet and self.settings.oms.testnet_only:
+            raise RuntimeError("OMS signed path is testnet-only")
+        if self.settings.account.mode == "live":
+            if os.environ.get("BETATREND_ALLOW_LIVE") != "1":
+                raise RuntimeError("live trading requires BETATREND_ALLOW_LIVE=1")
+            if confirm != "YES":
+                raise RuntimeError("live trading requires confirm=YES")
         params = {
             "symbol": symbol.upper(),
             "side": side,

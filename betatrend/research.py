@@ -90,7 +90,7 @@ def paper_once(settings: Settings, *, force_demo: bool = False, execute: bool = 
     extras = cycle.targets[0].extras if cycle.targets else {}
     return {
         "timestamp": str(ts),
-        "market_score": cycle.features.market_score,
+        "market_vol": cycle.features.market_vol,
         "notionals": cycle.notionals,
         "n_intents": len(cycle.intents),
         "side": extras.get("side"),

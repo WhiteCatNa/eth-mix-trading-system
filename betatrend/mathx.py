@@ -57,26 +57,6 @@ def annualized_return(equity: pd.Series, bars_per_year: int = BARS_PER_YEAR) -> 
     n = len(eq) - 1
     return float((eq.iloc[-1] / eq.iloc[0]) ** (bars_per_year / n) - 1.0)
 
-
-def ols_beta(y: np.ndarray, x: np.ndarray, clip: tuple[float, float] = (0.15, 3.0)) -> float:
-    """y 对 x 的无截距 OLS β（先去均值，等价于有截距回归的斜率）。
-
-    样本太短、x 方差为 0 时退回 1.0。结果夹在 [0.15, 3] 防止异常 β 撑爆组合帽。
-    """
-    n = min(len(y), len(x))
-    if n < 20:
-        return 1.0
-    yy = np.asarray(y[-n:], dtype=float)
-    xx = np.asarray(x[-n:], dtype=float)
-    xx = xx - xx.mean()
-    yy = yy - yy.mean()
-    den = float(np.dot(xx, xx))
-    if den < 1e-18:
-        return 1.0
-    b = float(np.dot(xx, yy) / den)
-    return float(np.clip(b, clip[0], clip[1]))
-
-
 def horizon_return(close: np.ndarray, lookback: int, skip: int = 0) -> float:
     """过去 lookback 根的简单收益率，可选再往前 skip 根（跳过最近一段噪声）。
 
@@ -101,36 +81,13 @@ def realized_vol(returns: np.ndarray, lookback: int, bars_per_year: int = BARS_P
     return max(s * np.sqrt(bars_per_year), 1e-6)
 
 
-def tsmom_score(
-    close: np.ndarray,
-    returns: np.ndarray,
-    lookbacks: list[int],
-    weights: list[float],
-    skip: int = 0,
-) -> float:
-    """多周期、波动率缩放的时间序列动量分数。
-
-    每个 horizon：r / (σ_bar × √lookback)。除以 √L 是把“L 根累计收益”变成
-    近似单位根波动下的 t 统计量，短周期不会因为噪声绝对值小而被长周期淹没。
-    再按权重加权。正分=上涨趋势，负分=下跌趋势。
-    """
-    wsum = sum(weights) or 1.0
-    acc = 0.0
-    for lb, w in zip(lookbacks, weights):
-        r = horizon_return(close, lb, skip)
-        sig = float(np.std(returns[-max(lb, 5) :], ddof=1)) if len(returns) >= 5 else 0.01
-        sig = max(sig, 1e-6)
-        acc += (w / wsum) * (r / (sig * np.sqrt(max(lb, 1))))
-    return float(acc)
-
-
 def score_to_unit(
     score: float,
     scale: float = 1.0,
     min_position: float = 0.0,
     long_only: bool = False,
 ) -> float:
-    """把有符号 TSMOM 分数压成连续仓位 unit ∈ [-1, 1]。
+    """把有符号分数压成连续仓位 unit ∈ [-1, 1]。
 
     tanh 在零点附近近似线性，两端饱和：分数极强时也不会超过满仓。
     long_only 把负 unit 裁成 0（跌势空仓而不是做空）。

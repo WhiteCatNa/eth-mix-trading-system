@@ -16,6 +16,7 @@ DEFAULT_CONFIG = ROOT / "config" / "default.yaml"
 
 
 class AccountCfg(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     """账户与运行模式。paper/research 走本地撮合；testnet/live 走签名下单。"""
 
     initial_capital: float = 100_000.0
@@ -24,6 +25,7 @@ class AccountCfg(BaseModel):
 
 
 class UniverseCfg(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     """单一交易标的（默认 ETHUSDT）。"""
 
     symbol: str = "ETHUSDT"
@@ -54,6 +56,7 @@ class UniverseCfg(BaseModel):
 
 
 class BinanceCfg(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     futures_base: str = "https://fapi.binance.com"
     spot_base: str = "https://api.binance.com"
     testnet_futures_base: str = "https://testnet.binancefuture.com"
@@ -62,6 +65,7 @@ class BinanceCfg(BaseModel):
 
 
 class DataCfg(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     cache_dir: str = "data/cache"
     kline_interval: str = "1h"
     lookback_days: int = 500
@@ -69,12 +73,14 @@ class DataCfg(BaseModel):
 
 
 class FeesCfg(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     maker: float = 0.0002
     taker: float = 0.0005
     use_maker_for_entries: bool = True
 
 
 class SlippageCfg(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     market_bps: float = 1.5
 
 
@@ -97,25 +103,40 @@ class StrategyCfg(BaseModel):
     rebalance_hours: int = 8
     min_history: int = 360
     decision: str = "rl"
-    nn_blend: float = 1.0
     nn_smooth: float = 0.20
     nn_model_path: str = "models/eth_decision.pt"
-    nn_hidden: list[int] = Field(default_factory=lambda: [64, 32])
-    nn_dropout: float = 0.25
+    nn_hidden: list[int] = Field(default_factory=lambda: [128, 64])
+    nn_dropout: float = 0.2
     nn_seeds: int = 3
     nn_cost_bps: float = 8.0
     nn_epochs: int = 80
     nn_patience: int = 12
-    nn_delta_gain: float = 0.5
+    seq_len: int = 7
+    ppo_gamma: float = 0.99
+    ppo_gae_lambda: float = 0.95
+    ppo_clip: float = 0.2
+    ppo_ent_coef: float = 0.01
+    ppo_vf_coef: float = 0.5
+    ppo_lr: float = 3e-4
+    ppo_batch: int = 256
+    ppo_max_grad_norm: float = 0.5
+    ppo_inner_epochs: int = 4
+    ppo_replay_rollouts: int = 4
+    reward_ds_eta: float = 1.0 / 72.0
+    reward_dd_inc: float = 1.0
+    reward_dd_level: float = 0.05
+    reward_clip: float = 5.0
 
 
 class BacktestCfg(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     warmup_bars: int = 400
     report_dir: str = "reports"
     turnover_band_equity: float = 0.015
 
 
 class PaperCfg(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     rebalance_minutes: int = 60
     dry_run: bool = True
     state_file: str = "data/state/paper.json"
@@ -124,6 +145,7 @@ class PaperCfg(BaseModel):
 
 
 class OmsCfg(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     min_notional: float = 10.0
     client_id_prefix: str = "bt"
     testnet_only: bool = True
@@ -131,6 +153,7 @@ class OmsCfg(BaseModel):
 
 
 class LoggingCfg(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     level: str = "INFO"
     file: str = "logs/betatrend.log"
     audit_file: str = "logs/audit.jsonl"

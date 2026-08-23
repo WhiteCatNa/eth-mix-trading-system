@@ -1,8 +1,4 @@
-"""日志：控制台 + 滚动文件；审计：JSONL 一行一个事件。
-
-``setup_logging`` 全局只配置一次，避免 pytest / 多次 CLI 把 sink 叠满。
-审计日志与普通日志分开，方便事后对账 kill、成交、paper bar。
-"""
+"""日志：控制台 + 滚动文件；审计：JSONL 一行一个事件。"""
 from __future__ import annotations
 
 import json
@@ -28,8 +24,7 @@ def setup_logging(settings: Settings) -> None:
 
 
 def audit(settings: Settings, event: str, **payload: object) -> None:
-    """追加一条带 UTC 时间戳的 JSON 对象。失败应向上抛，不能默默丢掉审计。"""
-    path = ROOT / settings.control.audit_log
+    path = ROOT / settings.logging.audit_file
     path.parent.mkdir(parents=True, exist_ok=True)
     row = {
         "ts": datetime.now(timezone.utc).isoformat(),

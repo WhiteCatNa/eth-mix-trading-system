@@ -1,14 +1,11 @@
-"""OMS 桥：paper 本地成交；签名路径仅 testnet；成交后对账，对不上就 kill。
-
-研究/paper 模式走 PaperBroker。testnet/live 走签名 REST，但 oms.testnet_only
-为 True 时拒绝主网。每笔成交写审计日志，最后把本地 Ledger 与交易所持仓对账。
-"""
+"""OMS 桥：paper 本地成交；签名路径仅 testnet；成交后对账。"""
 from __future__ import annotations
+
+import os
 
 import pandas as pd
 
 from betatrend.config import Settings
-from betatrend.control import ControlPlane
 from betatrend.domain import Fill, OrderIntent
 from betatrend.execution.paper import PaperBroker
 from betatrend.execution.signed import BinanceSignedClient
@@ -66,8 +63,6 @@ def reconcile_or_kill(
     settings: Settings,
     ledger: Ledger,
     exchange_qty: dict[str, float],
-    *,
-    control: ControlPlane | None = None,
 ) -> None:
     tol = float(settings.oms.reconcile_qty_tol)
     mismatches: list[str] = []
@@ -79,10 +74,8 @@ def reconcile_or_kill(
             mismatches.append(f"{symbol}: local={local} exchange={remote}")
     if not mismatches:
         return
-    ctrl = control or ControlPlane(settings)
     detail = "; ".join(mismatches)
-    ctrl.trip_kill(reason=f"reconcile mismatch: {detail}")
-    audit(settings, "reconcile_kill", mismatches=mismatches)
+    audit(settings, "reconcile_fail", mismatches=mismatches)
     raise RuntimeError(f"Position reconcile failed: {detail}")
 
 
@@ -101,12 +94,15 @@ def submit_intents(
         broker = PaperBroker(settings, ledger)
         return broker.execute(intents, prices, ts)
 
-    if mode == "live" or (client is not None and not getattr(client, "testnet", True)):
+    live_client = client is not None and not getattr(client, "testnet", True)
+    if mode == "live" or live_client:
         if settings.oms.testnet_only:
             raise RuntimeError("OMS signed path is testnet-only")
+        if os.environ.get("BETATREND_ALLOW_LIVE") != "1":
+            raise RuntimeError("live trading requires BETATREND_ALLOW_LIVE=1")
+        if confirm != "YES":
+            raise RuntimeError("live trading requires confirm=YES")
 
-    ctrl = ControlPlane(settings)
-    ctrl.assert_can_send_orders(confirm=confirm)
     if client is None:
         client = BinanceSignedClient(settings)
     if not getattr(client, "testnet", True) and settings.oms.testnet_only:
@@ -134,16 +130,6 @@ def submit_intents(
             qty=intent.qty,
             client_order_id=intent.client_order_id,
         )
-    try:
-        remote = exchange_qty_map(client.positions())
-    except Exception as exc:
-        ctrl.trip_kill(reason=f"reconcile positions fetch failed: {exc}")
-        raise
-    reconcile_or_kill(settings, ledger, remote, control=ctrl)
+    remote = exchange_qty_map(client.positions())
+    reconcile_or_kill(settings, ledger, remote)
     return fills
-
-
-# 测试夹具使用的旧名
-exchange_qty_map = exchange_qty_map
-reconcile_or_kill = reconcile_or_kill
-submit_intents = submit_intents

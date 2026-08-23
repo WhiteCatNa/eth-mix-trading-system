@@ -1,11 +1,14 @@
-"""ETH 面板特征：收益、TSMOM、实现波动率。滚动统计只看截至当前 bar 的历史。"""
+"""ETH 面板特征：收益与实现波动率。滚动统计只看截至当前 bar 的历史。
+
+仓位由决策网输出；这里只提供反波动杠杆所需的 σ。
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import pandas as pd
 
-from betatrend.mathx import realized_vol, tsmom_score
+from betatrend.mathx import realized_vol
 
 
 def enrich_panel(df: pd.DataFrame) -> pd.DataFrame:
@@ -22,8 +25,6 @@ def enrich_panel(df: pd.DataFrame) -> pd.DataFrame:
 @dataclass
 class FeatureSet:
     vols: dict[str, float]
-    own_scores: dict[str, float]
-    market_score: float
     market_vol: float
 
 
@@ -32,28 +33,15 @@ def compute_features(
     market_symbol: str,
     *,
     vol_lookback: int,
-    lookbacks: list[int],
-    weights: list[float],
-    skip_hours: int,
 ) -> FeatureSet:
     if market_symbol not in panels:
         raise ValueError(f"Market symbol {market_symbol} missing from panels")
     mkt = panels[market_symbol]
-    mkt_close = mkt["close"].astype(float).values
     mkt_ret = mkt["ret"].astype(float).values
-    market_score = tsmom_score(mkt_close, mkt_ret, lookbacks, weights, skip_hours)
     market_vol = realized_vol(mkt_ret, vol_lookback)
 
     vols: dict[str, float] = {}
-    own_scores: dict[str, float] = {}
     for sym, panel in panels.items():
-        close = panel["close"].astype(float).values
         ret = panel["ret"].astype(float).values
         vols[sym] = realized_vol(ret, vol_lookback)
-        own_scores[sym] = tsmom_score(close, ret, lookbacks, weights, skip_hours)
-    return FeatureSet(
-        vols=vols,
-        own_scores=own_scores,
-        market_score=market_score,
-        market_vol=market_vol,
-    )
+    return FeatureSet(vols=vols, market_vol=market_vol)

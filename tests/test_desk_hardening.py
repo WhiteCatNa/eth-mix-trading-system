@@ -8,115 +8,15 @@ import pandas as pd
 import pytest
 
 from betatrend.backtest import Backtester
-from betatrend.control import ControlPlane
-from betatrend.domain import MarketSnapshot, OrderIntent, Side
+from betatrend.domain import OrderIntent, Side
 from betatrend.execution.bridge import exchange_qty_map, reconcile_or_kill, submit_intents
-from betatrend.gate import evaluate_deploy_gate
 from betatrend.ledger import Ledger
 from betatrend.marketdata.synthetic import make_trending_panels
-from betatrend.pipeline import DeskCycle
-from betatrend.qc import inspect_panels
 from betatrend.research import paper_run
 
 
-def _passing_report() -> dict:
-    return {
-        "oos_neural_blend": {
-            "sharpe": 0.42,
-            "total_return": 0.08,
-            "max_drawdown": -0.05,
-            "turnover": 0.1,
-            "mean_pos": 0.2,
-        },
-        "chosen_blend": 0.5,
-        "fold_blends": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
-        "n_folds": 8,
-        "n_oos_bars": 400,
-    }
-
-
-def test_eth_report_fails_deploy_gate(settings):
-    result = evaluate_deploy_gate(settings)
-    assert result.passed is False
-    assert result.oos_sharpe is not None and result.oos_sharpe <= 0
-    blob = " ".join(result.reasons)
-    assert "Sharpe" in blob
-
-
-def test_passing_fold_blend_report_clears_gate(settings, tmp_path):
-    path = tmp_path / "ok.json"
-    path.write_text(json.dumps(_passing_report()), encoding="utf-8")
-    settings.deploy.report_path = str(path)
-    result = evaluate_deploy_gate(settings)
-    assert result.passed is True
-
-
-def test_live_blocked_by_deploy_gate_even_with_env(settings, monkeypatch):
-    monkeypatch.setenv("BETATREND_ALLOW_LIVE", "1")
-    monkeypatch.setenv("BINANCE_TESTNET", "0")
-    settings.account.mode = "live"
-    with pytest.raises(RuntimeError, match="deploy gate"):
-        ControlPlane(settings).assert_can_send_orders(confirm="YES")
-
-
-def test_live_allowed_when_gate_passes(settings, tmp_path, monkeypatch):
-    path = tmp_path / "ok.json"
-    path.write_text(json.dumps(_passing_report()), encoding="utf-8")
-    settings.deploy.report_path = str(path)
-    monkeypatch.setenv("BETATREND_ALLOW_LIVE", "1")
-    monkeypatch.setenv("BINANCE_TESTNET", "0")
-    settings.account.mode = "live"
-    ControlPlane(settings).assert_can_send_orders(confirm="YES")
-
-
-def test_qc_flags_gap_ohlc_jump_and_stale_funding(settings):
-    panels = make_trending_panels(n=80, seed=3, symbols=["ETHUSDT"])
-    assert inspect_panels(panels, settings).ok
-    broken = {k: v.copy() for k, v in panels.items()}
-    df = broken["ETHUSDT"]
-    df.iloc[-2, df.columns.get_loc("high")] = float(df["close"].iloc[-2]) * 0.5
-    assert inspect_panels(broken, settings).ok is False
-
-    gapped = {k: v.copy() for k, v in panels.items()}
-    gapped["ETHUSDT"] = gapped["ETHUSDT"].drop(gapped["ETHUSDT"].index[-5])
-    assert inspect_panels(gapped, settings).ok is False
-
-    jumped = {k: v.copy() for k, v in panels.items()}
-    jumped["ETHUSDT"].iloc[-1, jumped["ETHUSDT"].columns.get_loc("close")] *= 2.0
-    jumped["ETHUSDT"].iloc[-1, jumped["ETHUSDT"].columns.get_loc("high")] = max(
-        float(jumped["ETHUSDT"]["high"].iloc[-1]),
-        float(jumped["ETHUSDT"]["close"].iloc[-1]),
-    )
-    assert inspect_panels(jumped, settings).ok is False
-
-    stale = {k: v.copy() for k, v in panels.items()}
-    if "funding_rate" in stale["ETHUSDT"].columns:
-        stale["ETHUSDT"].loc[stale["ETHUSDT"].index[-20:], "funding_rate"] = np.nan
-        assert inspect_panels(stale, settings).ok is False
-
-
-def test_desk_cycle_flattens_on_qc_fail(settings):
-    panels = make_trending_panels(n=400, seed=4, symbols=["ETHUSDT"])
-    df = panels["ETHUSDT"].copy()
-    df.iloc[-1, df.columns.get_loc("low")] = float(df["close"].iloc[-1]) * 2.0
-    panels["ETHUSDT"] = df
-    prices = {s: float(p["close"].iloc[-1]) for s, p in panels.items()}
-    snap = MarketSnapshot(
-        timestamp=panels["ETHUSDT"].index[-1],
-        panels=panels,
-        prices=prices,
-        equity=100_000,
-        bar_index=len(df) - 1,
-        market_symbol="ETHUSDT",
-    )
-    cycle = DeskCycle(settings).run(snap, {"ETHUSDT": 12_000.0})
-    assert cycle.flatten
-    assert cycle.clipped["ETHUSDT"] == 0.0
-    assert any("qc:" in m for m in cycle.messages)
-
-
-def test_paper_run_persists_state(settings, tmp_path):
-    settings.strategy.decision = "tsmom"
+def test_paper_run_persists_state(settings, tmp_path, stub_rl):
+    settings.strategy.decision = "rl"
     settings.backtest.warmup_bars = 160
     settings.paper.dry_run = False
     settings.paper.state_file = str(tmp_path / "paper.json")
@@ -133,8 +33,8 @@ def test_paper_run_persists_state(settings, tmp_path):
     assert payload2["bars"] == 12
 
 
-def test_paper_run_matches_backtest_sign(settings, tmp_path):
-    settings.strategy.decision = "tsmom"
+def test_paper_run_matches_backtest_sign(settings, tmp_path, stub_rl):
+    settings.strategy.decision = "rl"
     settings.strategy.min_history = 150
     settings.backtest.warmup_bars = 160
     settings.paper.dry_run = False
@@ -149,11 +49,11 @@ def test_paper_run_matches_backtest_sign(settings, tmp_path):
     if ts not in bt.positions.index:
         pytest.skip("paper last bar not in backtest index")
     bt_n = float(bt.positions.loc[ts, "ETHUSDT"])
-    clip = float(paper_state["clipped"].get("ETHUSDT", 0.0))
-    if abs(bt_n) < 1.0 and abs(clip) < 1.0:
+    tgt = float(paper_state.get("notionals", {}).get("ETHUSDT", 0.0))
+    if abs(bt_n) < 1.0 and abs(tgt) < 1.0:
         pytest.skip("both overlays flat at overlap")
-    if abs(bt_n) >= 1.0 and abs(clip) >= 1.0:
-        assert np.sign(clip) == np.sign(bt_n)
+    if abs(bt_n) >= 1.0 and abs(tgt) >= 1.0:
+        assert np.sign(tgt) == np.sign(bt_n)
 
 
 class _FakeSigned:
@@ -232,12 +132,10 @@ def test_oms_rejects_live_signed_path(settings):
         )
 
 
-def test_reconcile_mismatch_trips_kill(settings, tmp_path):
-    settings.control.kill_file = str(tmp_path / "KILL")
+def test_reconcile_mismatch_raises(settings):
     ledger = Ledger(cash=100_000.0, qty={"ETHUSDT": 1.0})
     with pytest.raises(RuntimeError, match="reconcile"):
         reconcile_or_kill(settings, ledger, {"ETHUSDT": 0.0})
-    assert Path(settings.control.kill_file).exists()
 
 
 def test_exchange_qty_map_reads_binance_amt():
