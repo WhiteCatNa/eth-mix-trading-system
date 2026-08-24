@@ -171,6 +171,23 @@ def test_reward_shaping_penalizes_drawdown_more_than_flat():
     assert r_crash.mean() < r_flat.mean()
     assert np.all(np.isfinite(r_crash))
     assert r_crash.min() >= -5.0 - 1e-6
+    r_crash_so = shape_rewards(crash, vol, so_w=1.0)
+    r_crash_noso = shape_rewards(crash, vol, so_w=0.0)
+    assert r_crash_so.mean() < r_crash_noso.mean()
+
+
+def test_sortino_term_penalizes_left_tail_more_than_right():
+    from betatrend.nn.reward import shape_rewards
+
+    vol = np.full(48, 0.20)
+    left = np.zeros(48)
+    left[10:14] = -0.03
+    right = np.zeros(48)
+    right[10:14] = 0.03
+    r_left = shape_rewards(left, vol, so_w=1.0, dd_inc=0.0, dd_level=0.0)
+    r_right = shape_rewards(right, vol, so_w=1.0, dd_inc=0.0, dd_level=0.0)
+    assert r_left.mean() < r_right.mean()
+    assert np.all(np.isfinite(r_left)) and np.all(np.isfinite(r_right))
 
 
 def test_replay_buffer_keeps_recent_rollouts():
@@ -191,3 +208,54 @@ def test_replay_buffer_keeps_recent_rollouts():
     assert packed["actions"].shape == (8,)
     np.testing.assert_allclose(packed["actions"][:4], 1.0)
     np.testing.assert_allclose(packed["actions"][4:], 2.0)
+
+
+def test_warm_start_does_not_match_scratch_init(settings):
+    from betatrend.nn.train import _train_one
+
+    rng = np.random.default_rng(0)
+    n = 48
+    windows = rng.normal(size=(n, SEQ_LEN, N_FEAT)).astype(np.float32)
+    y = rng.normal(size=n).astype(np.float64) * 0.01
+    lev = np.ones(n, dtype=np.float64)
+    vol = np.full(n, 0.2, dtype=np.float64)
+    settings.strategy.nn_epochs = 2
+    settings.strategy.ppo_inner_epochs = 1
+    settings.strategy.ppo_replay_rollouts = 1
+    cfg = settings.strategy
+    prior = _train_one(windows, y, lev, vol, cfg=cfg, cost=8e-4, seed=1, y_clip=0.04)
+    init_state = {k: v.detach().cpu().clone() for k, v in prior.state_dict().items()}
+    warm = _train_one(
+        windows, y, lev, vol, cfg=cfg, cost=8e-4, seed=2, y_clip=0.04, init_state=init_state
+    )
+    scratch = _train_one(windows, y, lev, vol, cfg=cfg, cost=8e-4, seed=2, y_clip=0.04)
+    w_warm = next(warm.parameters()).detach()
+    w_scratch = next(scratch.parameters()).detach()
+    assert not torch.allclose(w_warm, w_scratch)
+
+
+def test_dump_ckpt_is_atomic_and_loadable(tmp_path):
+    from betatrend.config import StrategyCfg
+    from betatrend.nn.train import _ckpt_payload, _dump_ckpt
+
+    cfg = StrategyCfg()
+    path = tmp_path / "mid.pt"
+    states = [{"w": torch.tensor([1.0, 2.0])}]
+    _dump_ckpt(
+        path,
+        _ckpt_payload(
+            states=states,
+            median=np.zeros(3, dtype=np.float32),
+            iqr=np.ones(3, dtype=np.float32),
+            cfg=cfg,
+            seq_len=7,
+            extra={"step": 500, "partial": True},
+        ),
+    )
+    assert path.exists()
+    assert not path.with_name("mid.pt.tmp").exists()
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    assert blob["kind"] == "ppo"
+    assert blob["step"] == 500
+    assert blob["partial"] is True
+    assert blob["n_feat"] == N_FEAT

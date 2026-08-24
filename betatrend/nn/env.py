@@ -57,6 +57,7 @@ class ResetCfg:
     dd_inc: float = 1.0
     dd_level: float = 0.05
     clip: float = 5.0
+    so_w: float = 1.0
     seq_len: int = SEQ_LEN
     fold_id: int = 0
     seed: int = 0
@@ -80,7 +81,7 @@ class ResetCfg:
 
 
 class RewardMachine:
-    """Stepwise copy of ``shape_rewards`` (differential Sharpe − drawdown)."""
+    """Stepwise copy of ``shape_rewards`` (differential Sharpe + Sortino − drawdown)."""
 
     def __init__(
         self,
@@ -88,18 +89,21 @@ class RewardMachine:
         dd_inc: float = 1.0,
         dd_level: float = 0.05,
         clip: float = 5.0,
+        so_w: float = 1.0,
         bars_per_year: int = BARS_PER_YEAR,
     ):
         self.eta = float(np.clip(eta, 1e-4, 0.5))
         self.dd_inc = float(dd_inc)
         self.dd_level = float(dd_level)
         self.clip = float(clip)
+        self.so_w = float(so_w)
         self.bars_per_year = float(bars_per_year)
         self.reset()
 
     def reset(self) -> None:
         self.a = 0.0
         self.b = 1.0
+        self.dwn = 1.0
         self.equity = 1.0
         self.peak = 1.0
         self.prev_depth = 0.0
@@ -107,19 +111,24 @@ class RewardMachine:
     def step(self, pnl: float, vol_ann: float) -> float:
         hourly_vol = max(vol_ann / math.sqrt(self.bars_per_year), 1e-6)
         rt = float(np.clip(pnl / hourly_vol, -R_VOL_CLIP, R_VOL_CLIP))
+        down2 = rt * rt if rt < 0.0 else 0.0
         d_a = rt - self.a
         d_b = rt * rt - self.b
+        d_d = down2 - self.dwn
         var = max(self.b - self.a * self.a, 1e-8)
+        d_s = max(self.dwn, 1e-8)
         d_sharpe = (self.b * d_a - 0.5 * self.a * d_b) / (var**1.5)
+        d_sortino = (self.dwn * d_a - 0.5 * self.a * d_d) / (d_s**1.5)
         self.a += self.eta * d_a
         self.b += self.eta * d_b
+        self.dwn += self.eta * d_d
         self.equity *= 1.0 + float(np.clip(pnl, -PNL_CLIP, PNL_CLIP))
         self.peak = max(self.peak, self.equity)
         depth = (self.peak - self.equity) / max(self.peak, 1e-12)
         deepen = max(depth - self.prev_depth, 0.0)
         self.prev_depth = depth
         dd_pen = self.dd_inc * deepen + self.dd_level * depth
-        return float(np.clip(d_sharpe - dd_pen, -self.clip, self.clip))
+        return float(np.clip(d_sharpe + self.so_w * d_sortino - dd_pen, -self.clip, self.clip))
 
 
 def overlay_rewards_py(
@@ -133,9 +142,10 @@ def overlay_rewards_py(
     dd_inc: float = 1.0,
     dd_level: float = 0.05,
     clip: float = 5.0,
+    so_w: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     pnl = bar_pnl(actions, y, lev, cost)
-    machine = RewardMachine(eta=eta, dd_inc=dd_inc, dd_level=dd_level, clip=clip)
+    machine = RewardMachine(eta=eta, dd_inc=dd_inc, dd_level=dd_level, clip=clip, so_w=so_w)
     rewards = np.empty(len(pnl), dtype=np.float32)
     for i in range(len(pnl)):
         rewards[i] = machine.step(float(pnl[i]), float(vol_ann[i]))
@@ -153,10 +163,11 @@ def overlay_rewards(
     dd_inc: float = 1.0,
     dd_level: float = 0.05,
     clip: float = 5.0,
+    so_w: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     rust = try_rust()
     if rust is not None:
-        pnl, rew = rust.overlay_rewards(
+        args = (
             np.asarray(actions, dtype=np.float64).ravel().tolist(),
             np.asarray(y, dtype=np.float64).ravel().tolist(),
             np.asarray(lev, dtype=np.float64).ravel().tolist(),
@@ -167,9 +178,16 @@ def overlay_rewards(
             float(dd_level),
             float(clip),
         )
+        try:
+            pnl, rew = rust.overlay_rewards(*args, float(so_w))
+        except TypeError:
+            pnl, rew = overlay_rewards_py(
+                actions, y, lev, vol_ann, cost, eta=eta, dd_inc=dd_inc, dd_level=dd_level, clip=clip, so_w=so_w
+            )
+            return np.asarray(pnl, dtype=np.float64), np.asarray(rew, dtype=np.float32)
         return np.asarray(pnl, dtype=np.float64), np.asarray(rew, dtype=np.float32)
     return overlay_rewards_py(
-        actions, y, lev, vol_ann, cost, eta=eta, dd_inc=dd_inc, dd_level=dd_level, clip=clip
+        actions, y, lev, vol_ann, cost, eta=eta, dd_inc=dd_inc, dd_level=dd_level, clip=clip, so_w=so_w
     )
 
 
@@ -253,7 +271,11 @@ class OverlayEnv:
         self.median = np.median(self.x, axis=0)
         self.iqr = np.clip(np.percentile(self.x, 75, axis=0) - np.percentile(self.x, 25, axis=0), 1e-6, None)
         self.rm = RewardMachine(
-            eta=self.cfg.eta, dd_inc=self.cfg.dd_inc, dd_level=self.cfg.dd_level, clip=self.cfg.clip
+            eta=self.cfg.eta,
+            dd_inc=self.cfg.dd_inc,
+            dd_level=self.cfg.dd_level,
+            clip=self.cfg.clip,
+            so_w=self.cfg.so_w,
         )
         self.t = 0
         self.end = len(self.x)
@@ -278,6 +300,11 @@ class OverlayEnv:
             )
         self.t = int(self.cfg.start)
         self.end = int(self.cfg.end) if self.cfg.end is not None else max(len(self.x) - 2, self.t)
+        self.rm.so_w = float(self.cfg.so_w)
+        self.rm.eta = float(np.clip(self.cfg.eta, 1e-4, 0.5))
+        self.rm.dd_inc = float(self.cfg.dd_inc)
+        self.rm.dd_level = float(self.cfg.dd_level)
+        self.rm.clip = float(self.cfg.clip)
         self.rm.reset()
         self.prev_exp = 0.0
         return self._scaled_window(self.t)
@@ -315,7 +342,11 @@ class BacktestEnv:
         self.median = np.median(self.x, axis=0)
         self.iqr = np.clip(np.percentile(self.x, 75, axis=0) - np.percentile(self.x, 25, axis=0), 1e-6, None)
         self.rm = RewardMachine(
-            eta=self.cfg.eta, dd_inc=self.cfg.dd_inc, dd_level=self.cfg.dd_level, clip=self.cfg.clip
+            eta=self.cfg.eta,
+            dd_inc=self.cfg.dd_inc,
+            dd_level=self.cfg.dd_level,
+            clip=self.cfg.clip,
+            so_w=self.cfg.so_w,
         )
         self.cash = self.cfg.initial_equity
         self.qty = 0.0
@@ -340,6 +371,11 @@ class BacktestEnv:
         self.t = int(self.cfg.start)
         self.end = int(self.cfg.end) if self.cfg.end is not None else len(self.close)
         self.last_close = float(self.close[max(self.t - 1, 0)]) if self.t > 0 else float(self.close[0])
+        self.rm.so_w = float(self.cfg.so_w)
+        self.rm.eta = float(np.clip(self.cfg.eta, 1e-4, 0.5))
+        self.rm.dd_inc = float(self.cfg.dd_inc)
+        self.rm.dd_level = float(self.cfg.dd_level)
+        self.rm.clip = float(self.cfg.clip)
         self.rm.reset()
         return self._window(self.t)
 
@@ -440,6 +476,7 @@ def dump_golden(out_dir: Path, n: int = 400, seed: int = 7) -> Path:
         dd_inc=cfg.dd_inc,
         dd_level=cfg.dd_level,
         clip=cfg.clip,
+        so_w=cfg.so_w,
     )
     ref = shape_rewards(
         _pnl,
@@ -448,6 +485,7 @@ def dump_golden(out_dir: Path, n: int = 400, seed: int = 7) -> Path:
         dd_inc=cfg.dd_inc,
         dd_level=cfg.dd_level,
         clip=cfg.clip,
+        so_w=cfg.so_w,
     )
     err = float(np.max(np.abs(steps["reward"].to_numpy() - ref)))
     (out_dir / "checksum.json").write_text(

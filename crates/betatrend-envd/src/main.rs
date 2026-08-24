@@ -45,6 +45,8 @@ struct Msg {
     dd_level: Option<f64>,
     #[serde(default)]
     clip: Option<f64>,
+    #[serde(default)]
+    so_w: Option<f64>,
 }
 
 fn flags5(v: Option<Vec<bool>>) -> Option<[bool; 5]> {
@@ -140,6 +142,7 @@ fn main() {
                         msg.dd_inc.unwrap_or(1.0),
                         msg.dd_level.unwrap_or(0.05),
                         msg.clip.unwrap_or(5.0),
+                        msg.so_w.unwrap_or(1.0),
                     );
                     serde_json::json!({"pnl": pnl, "reward": rew})
                 }

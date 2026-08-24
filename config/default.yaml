@@ -64,10 +64,12 @@ strategy:
   ppo_max_grad_norm: 0.5
   ppo_inner_epochs: 4
   ppo_replay_rollouts: 4
-  reward_ds_eta: 0.0139   # ≈ 1/72，差分夏普的滑动窗约 3 天
+  nn_ckpt_every: 80       # 每 80 个 epoch 落一份，折内也会写
+  reward_ds_eta: 0.0139   # ≈ 1/72，差分夏普/索提诺的滑动窗约 3 天
   reward_dd_inc: 1.0      # 回撤加深惩罚
   reward_dd_level: 0.05   # 停留在回撤里的持续惩罚
   reward_clip: 5.0
+  reward_so_w: 1.0        # 差分 Sortino 权重，与差分 Sharpe 相加
 
 backtest:
   warmup_bars: 400

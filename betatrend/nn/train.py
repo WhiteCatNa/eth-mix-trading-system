@@ -5,6 +5,7 @@
   - 每折只在训练集上拟合 scaler，测试折绝不回头挑参
   - 损失 = clipped surrogate + value + entropy，没有 TSMOM 残差项
   - 全样本权重只在 walk-forward 报告过关后用于推理，OOS 数字才是诚实成绩
+  - 折与折之间按 seed 链条热启动：网络权重接着用，scaler / 优化器每折重来
 """
 from __future__ import annotations
 
@@ -108,6 +109,7 @@ def _rollout(
         dd_inc=float(cfg.reward_dd_inc),
         dd_level=float(cfg.reward_dd_level),
         clip=float(cfg.reward_clip),
+        so_w=float(cfg.reward_so_w),
     )
     return actions, logps, values, rewards
 
@@ -154,6 +156,41 @@ def _ppo_update(
             opt.step()
 
 
+def _dump_ckpt(path: Path, payload: dict) -> Path:
+    """Atomic torch.save so a kill mid-write cannot leave a truncated file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)
+    tmp.replace(path)
+    logger.info("saved checkpoint {}", path)
+    return path
+
+
+def _ckpt_payload(
+    *,
+    states: list,
+    median: np.ndarray,
+    iqr: np.ndarray,
+    cfg: StrategyCfg,
+    seq_len: int,
+    extra: dict | None = None,
+) -> dict:
+    blob = {
+        "kind": "ppo",
+        "seq_len": int(seq_len),
+        "n_feat": N_FEAT,
+        "feature_names": FEATURE_NAMES,
+        "median": median,
+        "iqr": iqr,
+        "dropout": cfg.nn_dropout,
+        "states": states,
+    }
+    if extra:
+        blob.update(extra)
+    return blob
+
+
 def _train_one(
     windows: np.ndarray,
     y: np.ndarray,
@@ -164,24 +201,65 @@ def _train_one(
     cost: float,
     seed: int,
     y_clip: float,
+    ckpt_prefix: Path | None = None,
+    ckpt_meta: dict | None = None,
+    init_state: dict | None = None,
 ) -> PPOActorCritic:
     torch.manual_seed(seed)
     np.random.seed(seed)
     seq_len = int(cfg.seq_len) if cfg.seq_len else SEQ_LEN
     net = PPOActorCritic(n_feat=N_FEAT, seq_len=seq_len, dropout=cfg.nn_dropout)
+    if init_state is not None:
+        net.load_state_dict(init_state)
     opt = torch.optim.AdamW(net.parameters(), lr=float(cfg.ppo_lr), weight_decay=1e-4)
     yc = np.clip(y, -y_clip, y_clip)
     inner = max(int(cfg.ppo_inner_epochs), 1)
     epochs = max(int(cfg.nn_epochs), 1)
     replay = ReplayBuffer(n_rollouts=int(cfg.ppo_replay_rollouts))
-    logger.info("PPO start seed={} n={} epochs={} inner={} replay={}", seed, len(windows), epochs, inner, replay.n_rollouts)
+    ckpt_every = int(getattr(cfg, "nn_ckpt_every", 0) or 0)
+    logger.info(
+        "PPO start seed={} n={} epochs={} inner={} replay={} warm_start={}",
+        seed,
+        len(windows),
+        epochs,
+        inner,
+        replay.n_rollouts,
+        init_state is not None,
+    )
     for ep in range(epochs):
         actions, logps, values, rewards = _rollout(net, windows, yc, lev, vol_ann, cost, cfg)
         adv, ret = _gae(rewards, values, float(cfg.ppo_gamma), float(cfg.ppo_gae_lambda))
         replay.add(windows, actions, logps, adv, ret)
         _ppo_update(net, opt, replay.packed(), cfg, inner)
-        if ep == 0 or (ep + 1) % 20 == 0 or ep + 1 == epochs:
-            logger.info("PPO seed={} epoch {}/{} mean_r={:.4f}", seed, ep + 1, epochs, float(np.mean(rewards)))
+        step = ep + 1
+        if ep == 0 or step % 20 == 0 or step == epochs:
+            logger.info("PPO seed={} epoch {}/{} mean_r={:.4f}", seed, step, epochs, float(np.mean(rewards)))
+        if ckpt_prefix is not None and ckpt_every > 0 and step % ckpt_every == 0:
+            meta = dict(ckpt_meta or {})
+            median = meta.pop("median", None)
+            iqr = meta.pop("iqr", None)
+            if median is None or iqr is None:
+                continue
+            meta.update({"step": step, "seed": int(seed), "partial": step < epochs})
+            tags = []
+            if meta.get("fold_id") is not None:
+                tags.append(f"fold{int(meta['fold_id'])}")
+            tags.append(f"s{int(seed)}")
+            tags.append(f"e{step}")
+            mid = Path(ckpt_prefix).with_name(
+                f"{Path(ckpt_prefix).stem}_{'_'.join(tags)}{Path(ckpt_prefix).suffix}"
+            )
+            _dump_ckpt(
+                mid,
+                _ckpt_payload(
+                    states=[{k: v.cpu() for k, v in net.state_dict().items()}],
+                    median=median,
+                    iqr=iqr,
+                    cfg=cfg,
+                    seq_len=seq_len,
+                    extra=meta,
+                ),
+            )
     net.eval()
     return net
 
@@ -257,7 +335,11 @@ def list_fold_jobs(
     purge: int = 24,
     prod_holdout: int | None = None,
 ) -> list[dict]:
-    """Embarrassingly-parallel jobs: one walk-forward fold × seed, plus production seeds."""
+    """One walk-forward fold × seed, plus production seeds.
+
+    Independent only if each job starts from scratch. Sequential warm-start
+    needs train_decision_net or train_fold(..., init_path=previous.pt).
+    """
     warmup = max(cfg.min_history, 200)
     min_train = int(min_train if min_train is not None else 90 * 24)
     test_h = int(test_h if test_h is not None else 21 * 24)
@@ -305,8 +387,9 @@ def train_fold(
     fold_id: int = 0,
     seed: int = 7,
     path: Path | None = None,
+    init_path: Path | None = None,
 ) -> dict:
-    """Train one PPO seed on a single fold. Safe to run as an isolated job."""
+    """Train one PPO seed on a single fold. Pass init_path to warm-start from the previous fold."""
     cfg = settings.strategy
     seq_len = int(cfg.seq_len) if cfg.seq_len else SEQ_LEN
     cost = cfg.nn_cost_bps / 10_000.0
@@ -321,6 +404,13 @@ def train_fold(
     train_idx = np.asarray(train_idx, dtype=int)
     median, iqr = _fit_scaler(x_all[train_idx])
     win = make_windows(_robust_scale(x_all, median, iqr), seq_len=seq_len)
+    init_state = None
+    if init_path is not None:
+        blob = torch.load(Path(init_path), map_location="cpu", weights_only=False)
+        states = blob.get("states") or []
+        if not states:
+            raise ValueError(f"checkpoint has no states: {init_path}")
+        init_state = states[0]
     net = _train_one(
         win[train_idx],
         y_all[train_idx],
@@ -330,6 +420,9 @@ def train_fold(
         cost=cost,
         seed=int(seed),
         y_clip=y_clip,
+        ckpt_prefix=Path(path) if path is not None else None,
+        ckpt_meta={"median": median, "iqr": iqr, "fold_id": int(fold_id)} if path is not None else None,
+        init_state=init_state,
     )
     pred_te = None
     if test_idx is not None and len(test_idx):
@@ -345,24 +438,18 @@ def train_fold(
         "pred_te": pred_te,
     }
     if path is not None:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "kind": "ppo",
-                "seq_len": seq_len,
-                "n_feat": N_FEAT,
-                "feature_names": FEATURE_NAMES,
-                "median": median,
-                "iqr": iqr,
-                "dropout": cfg.nn_dropout,
-                "fold_id": int(fold_id),
-                "seed": int(seed),
-                "states": [{k: v.cpu() for k, v in net.state_dict().items()}],
-            },
-            path,
+        _dump_ckpt(
+            Path(path),
+            _ckpt_payload(
+                states=[{k: v.cpu() for k, v in net.state_dict().items()}],
+                median=median,
+                iqr=iqr,
+                cfg=cfg,
+                seq_len=seq_len,
+                extra={"fold_id": int(fold_id), "seed": int(seed)},
+            ),
         )
-        out["path"] = str(path)
+        out["path"] = str(Path(path))
     return out
 
 
@@ -400,6 +487,7 @@ def train_decision_net(
     test_h = int(test_h if test_h is not None else 21 * 24)
     prod_holdout = int(prod_holdout if prod_holdout is not None else 14 * 24)
     oos_nn = np.full(len(panel), np.nan)
+    path = Path(path or (ROOT / cfg.nn_model_path))
 
     folds = walk_forward_folds(
         len(panel), warmup=warmup, min_train=min_train, test_h=test_h, purge=purge
@@ -413,21 +501,24 @@ def train_decision_net(
         max(int(cfg.nn_seeds), 1),
         max(int(cfg.nn_epochs), 1),
     )
+    n_seeds = max(int(cfg.nn_seeds), 1)
+    prev_states: list[dict | None] = [None] * n_seeds
     fold = 0
     for fold, tr_h, te in folds:
         logger.info(
-            "fold {}/{} train_idx=[{}, {}) n_train={} n_test={}",
+            "fold {}/{} train_idx=[{}, {}) n_train={} n_test={} warm_start={}",
             fold + 1,
             len(folds),
             int(tr_h[0]),
             int(tr_h[-1] + 1),
             len(tr_h),
             len(te),
+            prev_states[0] is not None,
         )
         median, iqr = _fit_scaler(x_all[tr_h])
         win = make_windows(_robust_scale(x_all, median, iqr), seq_len=seq_len)
         preds = []
-        for seed in range(max(int(cfg.nn_seeds), 1)):
+        for seed in range(n_seeds):
             net = _train_one(
                 win[tr_h],
                 y_all[tr_h],
@@ -437,7 +528,11 @@ def train_decision_net(
                 cost=cost,
                 seed=7 + seed + fold * 17,
                 y_clip=y_clip,
+                ckpt_prefix=path,
+                ckpt_meta={"median": median, "iqr": iqr, "fold_id": int(fold)},
+                init_state=prev_states[seed],
             )
+            prev_states[seed] = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
             preds.append(_predict(net, win[te]))
         pred_te = np.mean(np.stack(preds, axis=0), axis=0).reshape(-1)
         oos_nn[np.asarray(te)] = pred_te
@@ -458,7 +553,7 @@ def train_decision_net(
     median, iqr = _fit_scaler(x_all[tr_h])
     win = make_windows(_robust_scale(x_all, median, iqr), seq_len=seq_len)
     states = []
-    for seed in range(max(int(cfg.nn_seeds), 1)):
+    for seed in range(n_seeds):
         net = _train_one(
             win[tr_h],
             y_all[tr_h],
@@ -468,25 +563,26 @@ def train_decision_net(
             cost=cost,
             seed=101 + seed,
             y_clip=y_clip,
+            ckpt_prefix=path,
+            ckpt_meta={"median": median, "iqr": iqr, "horizon": horizon, "fold_id": -1},
+            init_state=prev_states[seed],
         )
         states.append({k: v.cpu() for k, v in net.state_dict().items()})
-
-    path = path or (ROOT / cfg.nn_model_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "kind": "ppo",
-            "seq_len": seq_len,
-            "n_feat": N_FEAT,
-            "feature_names": FEATURE_NAMES,
-            "median": median,
-            "iqr": iqr,
-            "dropout": cfg.nn_dropout,
-            "horizon": horizon,
-            "states": states,
-        },
-        path,
-    )
+        _dump_ckpt(
+            path,
+            _ckpt_payload(
+                states=states,
+                median=median,
+                iqr=iqr,
+                cfg=cfg,
+                seq_len=seq_len,
+                extra={
+                    "horizon": horizon,
+                    "n_seeds_done": len(states),
+                    "partial": len(states) < n_seeds,
+                },
+            ),
+        )
     oos_df = pd.DataFrame(
         {"nn_unit": oos_nn, "y": y_all, "lev": lev_all},
         index=panel.index,
@@ -514,8 +610,9 @@ def train_decision_net(
         "label": "hourly_ppo_from_next_open",
         "obs": f"[{seq_len}, {N_FEAT}]",
         "note": (
-            "Walk-forward OOS for PPO actor (greedy). Primary eval is Sharpe and max drawdown, "
-            "not raw return. Position is the decision net only; no TSMOM residual."
+            "Walk-forward OOS for PPO actor (greedy), warm-started across folds per seed. "
+            "Primary eval is Sharpe and max drawdown, not raw return. "
+            "Position is the decision net only; no TSMOM residual."
         ),
     }
     path.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")

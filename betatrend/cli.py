@@ -159,6 +159,7 @@ def cmd_train_fold(args) -> int:
         fold_id=int(job["fold_id"]),
         seed=int(job["seed"]),
         path=out,
+        init_path=Path(args.init) if getattr(args, "init", None) else None,
     )
     console.print_json(json.dumps({k: v for k, v in result.items() if k != "pred_te"}, default=str))
     return 0
@@ -261,6 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     tf.add_argument("--seed", type=int, default=7)
     tf.add_argument("--job-json", type=str, default=None)
     tf.add_argument("--out", type=str, default=None)
+    tf.add_argument("--init", type=str, default=None, help="Previous-fold checkpoint to warm-start")
     tf.set_defaults(func=cmd_train_fold)
 
     tj = sub.add_parser("train-fold-jobs", help="Print JSON list of independent fold+seed jobs")

@@ -124,10 +124,12 @@ class StrategyCfg(BaseModel):
     ppo_max_grad_norm: float = 0.5
     ppo_inner_epochs: int = 4
     ppo_replay_rollouts: int = 4
+    nn_ckpt_every: int = 80  # PPO epoch 间隔落盘；0 表示只在整段结束时写
     reward_ds_eta: float = 1.0 / 72.0
     reward_dd_inc: float = 1.0
     reward_dd_level: float = 0.05
     reward_clip: float = 5.0
+    reward_so_w: float = 1.0
 
 
 class BacktestCfg(BaseModel):

@@ -33,6 +33,7 @@ def test_stepwise_reward_matches_batch_shape_rewards():
         dd_inc=cfg.dd_inc,
         dd_level=cfg.dd_level,
         clip=cfg.clip,
+        so_w=cfg.so_w,
     )
     ref_pnl = bar_pnl(actions, env.y[sl], env.lev[sl], cfg.cost)
     ref_rew = shape_rewards(
@@ -42,6 +43,7 @@ def test_stepwise_reward_matches_batch_shape_rewards():
         dd_inc=cfg.dd_inc,
         dd_level=cfg.dd_level,
         clip=cfg.clip,
+        so_w=cfg.so_w,
     )
     np.testing.assert_allclose(pnl, ref_pnl, atol=1e-12)
     np.testing.assert_allclose(rew, ref_rew, atol=1e-6)
@@ -71,6 +73,7 @@ def test_overlay_env_stepwise_matches_batch():
         dd_inc=cfg.dd_inc,
         dd_level=cfg.dd_level,
         clip=cfg.clip,
+        so_w=cfg.so_w,
     )
     np.testing.assert_allclose(rews, batch, atol=1e-6)
 

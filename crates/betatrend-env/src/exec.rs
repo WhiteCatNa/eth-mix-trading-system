@@ -29,9 +29,10 @@ pub fn overlay_rewards(
     dd_inc: f64,
     dd_level: f64,
     clip: f64,
+    so_w: f64,
 ) -> (Vec<f64>, Vec<f64>) {
     let pnl = overlay_pnl(actions, y, lev, cost);
-    let mut rm = RewardMachine::new(eta, dd_inc, dd_level, clip);
+    let mut rm = RewardMachine::new(eta, dd_inc, dd_level, clip, so_w);
     let mut rew = Vec::with_capacity(pnl.len());
     for t in 0..pnl.len() {
         rew.push(rm.step(pnl[t], vol_ann[t]));

@@ -65,7 +65,7 @@ impl OverlayEnv {
             .collect();
         let scaler = Scaler::fit(&x);
         let exec = OverlayExec::new(y.clone(), lev.clone(), vol.clone(), cfg.cost);
-        let rm = RewardMachine::new(cfg.eta, cfg.dd_inc, cfg.dd_level, cfg.clip);
+        let rm = RewardMachine::new(cfg.eta, cfg.dd_inc, cfg.dd_level, cfg.clip, cfg.so_w);
         let mut env = Self {
             bars,
             cfg,
@@ -176,7 +176,7 @@ impl TradingEnv for OverlayEnv {
             .map(|v| vol_leverage(*v, self.cfg.target_vol, self.cfg.max_leverage))
             .collect();
         self.exec = OverlayExec::new(self.y.clone(), self.lev.clone(), self.vol.clone(), self.cfg.cost);
-        self.rm = RewardMachine::new(self.cfg.eta, self.cfg.dd_inc, self.cfg.dd_level, self.cfg.clip);
+        self.rm = RewardMachine::new(self.cfg.eta, self.cfg.dd_inc, self.cfg.dd_level, self.cfg.clip, self.cfg.so_w);
         self.fit_scaler();
         self.rebuild_windows();
         self.exec.reset();
@@ -249,7 +249,7 @@ impl BacktestEnv {
             cfg.risk_budget,
             cfg.turnover_band_equity,
         );
-        let rm = RewardMachine::new(cfg.eta, cfg.dd_inc, cfg.dd_level, cfg.clip);
+        let rm = RewardMachine::new(cfg.eta, cfg.dd_inc, cfg.dd_level, cfg.clip, cfg.so_w);
         let mut env = Self {
             cfg,
             x,
@@ -297,7 +297,7 @@ impl TradingEnv for BacktestEnv {
 
     fn reset(&mut self, cfg: ResetCfg) -> Vec<f32> {
         self.cfg = cfg;
-        self.rm = RewardMachine::new(self.cfg.eta, self.cfg.dd_inc, self.cfg.dd_level, self.cfg.clip);
+        self.rm = RewardMachine::new(self.cfg.eta, self.cfg.dd_inc, self.cfg.dd_level, self.cfg.clip, self.cfg.so_w);
         self.exec.fee_rate = self.cfg.fee_rate;
         self.exec.slip_bps = self.cfg.slip_bps;
         self.exec.funding_interval_hours = self.cfg.funding_interval_hours;
