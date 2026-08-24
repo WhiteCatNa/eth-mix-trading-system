@@ -162,6 +162,9 @@ pytest -q
 |:--|:--|
 | `fetch --refresh` | 忽略 parquet 缓存，重新拉 Binance |
 | `train-nn` | 输出 `models/eth_decision.pt/.json/_oos.parquet`。报告是 walk-forward OOS；落盘权重是另一次（扣 holdout）拟合 |
+| `train-nn` 的两套 OOS | `oos_neural` 走 desk 执行契约（EMA 每 8h 前进一步、`min_position` 死区、期间冻结、实盘费率），是主指标；`oos_raw_signal` 是逐 bar 裸信号，仅作参照，desk 永远不会那样交易 |
+| `train-nn --jobs N` | 折内 N 个 seed 并行（默认取 `nn_jobs`）。结果与串行逐张量一致；`--threads-per-job` 可调每进程线程数 |
+| 奖励口径 | `r - λ·min(r,0)²`，r = 执行对齐 PnL / 当时小时波动。曾用 differential Sharpe，但它的路径均值不随夏普单调——真实 ETH 上把「全程空仓」排成了最优解，详见 `nn/reward.py` |
 | `paper-once` | 最新完成的 T+1 周期：倒数第二根收盘出信号，最后一根开盘成交。每次从空仓+初始资金起算，不读 paper 账本 |
 | `paper-run --execute` | 本地成交；`--execute` 会忽略 `paper.dry_run`。状态写入 `last_reb_ts` / pending / EMA |
 | `paper-run --reset-state` | 清空 `data/state/paper.json` 重来 |
@@ -186,8 +189,19 @@ strategy:
   min_position: 0.05                    # |unit| 低于此 → 空仓
   rebalance_hours: 8                    # 与资金费同频；desk 最少 8h
   decision: rl                          # 写入配置但不分支；只有 PPO 或 flat
-  nn_smooth: 0.20                       # 推理 EMA；训练 OOS overlay 不用
+  vol_lookback: 72                      # 定杠杆的 σ 窗口；desk 与训练/OOS 共用这一个
+  nn_smooth: 0.20                       # 推理 EMA；OOS 主指标也按同一份走一遍
   nn_model_path: models/eth_decision.pt
+  nn_arch: mlp                          # mlp 默认；lstm 仅对照
+  nn_hidden: [64, 64]
+  nn_patience: 12                       # 验证 Sharpe 无提升则停，回滚最优权重
+  nn_seeds: 3                           # 每折 3 条 warm-start 链，OOS 取均值
+  nn_jobs: 3                            # 折内 seed 并行进程数；1 = 串行。折与折仍严格串行
+  ppo_inner_epochs: 3                   # inner × replay = 每样本反传次数，标准 PPO 在 3~10
+  ppo_replay_rollouts: 2
+  reward_down_lambda: 0.5               # 奖励 = r - λ·min(r,0)²，r = PnL / 小时波动
+  reward_dd_inc: 0.0                    # 路径回撤项默认关（下行方差已经把回撤管住）
+  reward_dd_level: 0.0
 account: { mode: paper }                # CLI 不下真实单
 oms: { testnet_only: true }             # 默认拒绝主网签名单
 ```
@@ -205,7 +219,7 @@ paper: { dry_run: true, state_file: data/state/paper.json }  # CLI --execute 仍
 oms: { min_notional: 10.0, testnet_only: true }
 ```
 
-没有 `risk` / `qc` / `deploy` / `control.kill_file` 段。YAML 里残留的 `lookback_weights`、`score_scale`、`nn_hidden`、`nn_patience` 不会进入决策路径。
+没有 `risk` / `qc` / `deploy` / `control.kill_file` 段。YAML 里残留的 `lookback_weights`、`score_scale` 不会进入决策路径。`nn_hidden` / `nn_arch` / `nn_patience` 只影响训练，不影响已落盘权重的推理。
 
 </details>
 

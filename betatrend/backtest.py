@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 from loguru import logger
 
-from betatrend.config import Settings
+from betatrend.config import Settings, desk_hold_bars
 from betatrend.domain import Fill, MarketSnapshot
 from betatrend.ledger import Ledger
 from betatrend.mathx import annualized_return, calmar_ratio, max_drawdown, sharpe_ratio, sortino_ratio
@@ -70,7 +70,7 @@ class Backtester:
 
         pending: dict[str, float] | None = None
         last_reb = -10**9
-        reb_h = max(int(self.settings.strategy.rebalance_hours), 8)
+        reb_h = desk_hold_bars(self.settings.strategy)
         fee_entry = (
             self.settings.fees.maker if self.settings.fees.use_maker_for_entries else self.settings.fees.taker
         )

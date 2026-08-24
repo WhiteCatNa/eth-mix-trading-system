@@ -77,6 +77,10 @@ def cmd_train_nn(args) -> int:
     setup_logging(settings)
     if args.days:
         settings.data.lookback_days = args.days
+    if args.jobs is not None:
+        settings.strategy.nn_jobs = args.jobs
+    if args.threads_per_job is not None:
+        settings.strategy.nn_threads_per_job = args.threads_per_job
     settings.strategy.decision = "neural"
     from pathlib import Path as P
 
@@ -252,6 +256,18 @@ def build_parser() -> argparse.ArgumentParser:
     tn.add_argument("--days", type=int, default=None)
     tn.add_argument("--demo", action="store_true")
     tn.add_argument("--path", type=str, default=None)
+    tn.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help="Seeds trained in parallel per fold (1=sequential, <=0=one per seed)",
+    )
+    tn.add_argument(
+        "--threads-per-job",
+        type=int,
+        default=None,
+        help="torch threads inside each training process (0=auto split)",
+    )
     tn.set_defaults(func=cmd_train_nn)
 
     tf = sub.add_parser("train-fold", help="Train one walk-forward fold × seed (distributed worker)")

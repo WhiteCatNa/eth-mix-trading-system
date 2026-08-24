@@ -111,11 +111,10 @@ fn golden_overlay_pnl_and_reward() {
         &lev,
         &vol,
         cfg.cost,
-        cfg.eta,
+        cfg.down_lambda,
         cfg.dd_inc,
         cfg.dd_level,
         cfg.clip,
-        cfg.so_w,
     );
     let mut max_pnl: f64 = 0.0;
     let mut max_rew: f64 = 0.0;

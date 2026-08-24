@@ -1,26 +1,33 @@
-"""PPO Actor-Critic：最近 7 根 K 线 [B, 7, n_feat] → 仓位 unit ∈ [-1, 1]。
+"""PPO Actor-Critic：最近 seq_len 根 K 线 [B, T, n_feat] → 仓位 unit ∈ [-1, 1]。
 
-张量约定（PyTorch LSTM batch_first）：
-    [batch, seq=7, feat=n_feat]
-取最后时间步后是 [batch, 64]，不是 [batch, n_feat, 64]。
+张量约定（PyTorch batch_first）：
+    [batch, seq=T, feat=n_feat]
 
-结构：
-    LSTM(128) + Dropout(0.2) + LayerNorm
-    → LSTM(64) + Dropout(0.2) + LayerNorm
-    → 最后时间步 [B, 64]
-    → FC(128) + LayerNorm + ReLU + Dropout(0.3)
-    → FC(64) + LayerNorm + ReLU + Dropout(0.3)     ← 共享特征，复制进两个分支
-      ├─ Actor: FC(32)+LayerNorm+ReLU+Dropout(0.2)
-      │    ├─ 均值头 FC(1)+Tanh        （仓位均值，∈[-1,1]）
+结构（arch="mlp"，默认）：
+    展平 [B, T*n_feat]
+    → FC(h1) + LayerNorm + ReLU
+    → FC(h2) + LayerNorm + ReLU        ← 共享特征，复制进两个分支
+      ├─ Actor: FC(h2//2)+LayerNorm+ReLU
+      │    ├─ 均值头 FC(1)        （tanh 之前的仓位均值）
       │    └─ 标准差头 FC(1)+Softplus   （探索方差，>0）
-      └─ Critic: FC(32)+LayerNorm+ReLU+Dropout(0.2) → FC(1)  （V(s)）
+      └─ Critic: FC(h2//2)+LayerNorm+ReLU → FC(1)  （V(s)）
 
-输出层（均值/标准差/价值）不加 Dropout。
+结构（arch="lstm"，仅供对照）：把展平换成 LSTM(h1) → LSTM(h2) 取最后时间步。
+特征表里的 ret_1..168 / vol_24..168 / ema_gap 已经是多尺度时序聚合，
+所以循环栈能额外榨出的时间信息有限，而它要花掉 ~86% 的参数。
+
+不使用 Dropout。rollout 在 eval 下采样并记录 log_prob，PPO 更新在 train 下重算，
+两者的 dropout mask 不同会让重要性比率 π_new/π_old 变成噪声：实测在任何梯度更新之前
+就有 27% 的样本落到裁剪带外，信任域裁的是 mask 抖动而不是策略变化。
+正则化交给容量控制和验证集早停。
+
 均值头零初始化：确定性推理时未训练输出 ≈ 0。
 高斯定义在 tanh 之前的空间，动作再 squash 到 [-1, 1]，log_prob 做变量替换。
 没有 TSMOM 残差、没有 gate。
 """
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 import torch
 from torch import nn
@@ -31,65 +38,54 @@ from betatrend.nn.dataset import N_FEAT, SEQ_LEN
 _EPS = 1e-6
 _STD_MIN = 1e-4
 _STD_MAX = 2.0
-_LSTM_DROP = 0.2
-_FC_DROP = 0.3
-_BRANCH_DROP = 0.2
+DEFAULT_HIDDEN: tuple[int, int] = (64, 64)
+DEFAULT_ARCH = "mlp"
 
 
-def _dropouts(dropout: float) -> tuple[float, float, float]:
-    """dropout<=0 关闭全部；否则用生产档位，不跟单个标量混用。"""
-    if dropout <= 0.0:
-        return 0.0, 0.0, 0.0
-    return _LSTM_DROP, _FC_DROP, _BRANCH_DROP
+def _block(fan_in: int, width: int) -> nn.Sequential:
+    return nn.Sequential(nn.Linear(fan_in, width), nn.LayerNorm(width), nn.ReLU())
 
 
 class PPOActorCritic(nn.Module):
-    """[B, 7, n_feat] → 仓位。共享 FC(64) 后分 Actor / Critic。"""
+    """[B, T, n_feat] → 仓位。共享 trunk 后分 Actor / Critic。"""
 
     def __init__(
         self,
         n_feat: int = N_FEAT,
         seq_len: int = SEQ_LEN,
-        dropout: float = 0.2,
+        hidden: Sequence[int] = DEFAULT_HIDDEN,
+        arch: str = DEFAULT_ARCH,
     ):
         super().__init__()
         self.n_feat = int(n_feat)
         self.seq_len = int(seq_len)
-        lstm_p, fc_p, branch_p = _dropouts(float(dropout))
+        self.arch = str(arch)
+        h = [int(v) for v in hidden]
+        if len(h) < 2:
+            raise ValueError(f"hidden needs at least two widths, got {hidden}")
+        if self.arch not in ("mlp", "lstm"):
+            raise ValueError(f"arch must be 'mlp' or 'lstm', got {arch!r}")
+        self.hidden = tuple(h)
 
-        self.lstm1 = nn.LSTM(self.n_feat, 128, batch_first=True)
-        self.lstm_drop1 = nn.Dropout(lstm_p)
-        self.ln1 = nn.LayerNorm(128)
-        self.lstm2 = nn.LSTM(128, 64, batch_first=True)
-        self.lstm_drop2 = nn.Dropout(lstm_p)
-        self.ln2 = nn.LayerNorm(64)
+        if self.arch == "lstm":
+            self.lstm1 = nn.LSTM(self.n_feat, h[0], batch_first=True)
+            self.ln1 = nn.LayerNorm(h[0])
+            self.lstm2 = nn.LSTM(h[0], h[1], batch_first=True)
+            self.ln2 = nn.LayerNorm(h[1])
+            self.trunk = nn.Sequential(*[_block(h[i], h[i + 1]) for i in range(1, len(h) - 1)])
+            trunk_out = h[-1]
+        else:
+            widths = [self.seq_len * self.n_feat, *h]
+            self.trunk = nn.Sequential(*[_block(widths[i], widths[i + 1]) for i in range(len(h))])
+            trunk_out = h[-1]
 
-        self.fc = nn.Sequential(
-            nn.Linear(64, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Dropout(fc_p),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Dropout(fc_p),
-        )
-        self.actor_h = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.LayerNorm(32),
-            nn.ReLU(),
-            nn.Dropout(branch_p),
-        )
-        self.mean_head = nn.Linear(32, 1)
-        self.std_head = nn.Linear(32, 1)
+        branch = max(trunk_out // 2, 8)
+        self.actor_h = _block(trunk_out, branch)
+        self.mean_head = nn.Linear(branch, 1)
+        self.std_head = nn.Linear(branch, 1)
         self.softplus = nn.Softplus()
-        self.critic_h = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.LayerNorm(32),
-            nn.ReLU(),
-            nn.Dropout(branch_p),
-        )
-        self.value_head = nn.Linear(32, 1)
+        self.critic_h = _block(trunk_out, branch)
+        self.value_head = nn.Linear(branch, 1)
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -101,18 +97,19 @@ class PPOActorCritic(nn.Module):
         nn.init.zeros_(self.std_head.bias)
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        """共享特征 [B, 64]。x 必须是 [B, T=seq_len, F=n_feat]。"""
+        """共享特征 [B, hidden[-1]]。x 必须是 [B, T=seq_len, F=n_feat]。"""
         if x.ndim != 3:
             raise ValueError(f"expected [B, T, F], got {tuple(x.shape)}")
-        h, _ = self.lstm1(x)
-        h = self.ln1(self.lstm_drop1(h))
-        h, _ = self.lstm2(h)
-        h = self.ln2(self.lstm_drop2(h))
-        shared = self.fc(h[:, -1, :])
-        return shared
+        if self.arch == "lstm":
+            h, _ = self.lstm1(x)
+            h = self.ln1(h)
+            h, _ = self.lstm2(h)
+            h = self.ln2(h)
+            return self.trunk(h[:, -1, :])
+        return self.trunk(x.flatten(1))
 
     def _heads(self, shared: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """同一份 FC(64) 特征复制进 Actor / Critic。返回 mu_raw, std, value，皆 [B]。"""
+        """同一份 trunk 特征复制进 Actor / Critic。返回 mu_raw, std, value，皆 [B]。"""
         actor = self.actor_h(shared)
         critic = self.critic_h(shared)
         mu_raw = self.mean_head(actor).squeeze(-1)
@@ -134,20 +131,31 @@ class PPOActorCritic(nn.Module):
         return v
 
     def act(
-        self, x: torch.Tensor, *, deterministic: bool = False
+        self, x: torch.Tensor, *, deterministic: bool = False, std_scale: float = 1.0
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """采样或贪心动作。返回 action, log_prob, value, entropy，皆 [B]。"""
+        """采样或贪心动作。返回 action, log_prob, value, entropy，皆 [B]。
+
+        ``std_scale`` 缩放探索标准差。采样带来的换手会被奖励里的成本项直接扣掉，
+        而观测里没有仓位，agent 无法归因这块自伤成本，所以训练后期需要把它收小。
+        """
         dist, value = self._dist(x)
+        if std_scale != 1.0:
+            dist = Normal(dist.mean, (dist.stddev * float(std_scale)).clamp(_STD_MIN, _STD_MAX))
         u = dist.mean if deterministic else dist.sample()
         action = torch.tanh(u)
         logp = _tanh_log_prob(dist, u, action)
         return action, logp, value, dist.entropy()
 
     def evaluate(
-        self, x: torch.Tensor, action: torch.Tensor
+        self, x: torch.Tensor, action: torch.Tensor, *, std_scale: float = 1.0
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """对已存的 tanh 动作 ∈ (-1, 1) 算 log_prob / value / entropy。"""
+        """对已存的 tanh 动作 ∈ (-1, 1) 算 log_prob / value / entropy。
+
+        ``std_scale`` 必须与产生该动作的 rollout 一致，否则重要性比率会失真。
+        """
         dist, value = self._dist(x)
+        if std_scale != 1.0:
+            dist = Normal(dist.mean, (dist.stddev * float(std_scale)).clamp(_STD_MIN, _STD_MAX))
         a = action.clamp(-1.0 + 1e-4, 1.0 - 1e-4)
         u = torch.atanh(a)
         logp = _tanh_log_prob(dist, u, a)
@@ -160,4 +168,3 @@ def _tanh_log_prob(dist: Normal, u: torch.Tensor, action: torch.Tensor) -> torch
 
 
 DecisionNet = PPOActorCritic
-PPOActorCritic = PPOActorCritic

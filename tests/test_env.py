@@ -6,7 +6,16 @@ import pytest
 from betatrend.config import load_settings
 from betatrend.marketdata.synthetic import make_trending_panels
 from betatrend.nn.dataset import N_FEAT, SEQ_LEN, last_feature_window
-from betatrend.nn.env import BacktestEnv, OverlayEnv, ResetCfg, last_window, overlay_rewards_py, series_flags
+from betatrend.nn.env import (
+    BacktestEnv,
+    OverlayEnv,
+    ResetCfg,
+    last_window,
+    overlay_rewards,
+    overlay_rewards_py,
+    overlay_rewards_rust,
+    series_flags,
+)
 from betatrend.nn.reward import bar_pnl, shape_rewards
 from betatrend.nn.train import list_fold_jobs, walk_forward_folds
 
@@ -15,9 +24,22 @@ def _panel(n: int = 400, seed: int = 7):
     return make_trending_panels(n=n, seed=seed, symbols=["ETHUSDT"])["ETHUSDT"]
 
 
+# 回撤项默认关闭，测试里开着，好让三份实现的回撤分支都被覆盖。
+def _reward_cfg(panel) -> ResetCfg:
+    return ResetCfg(
+        start=180,
+        end=len(panel) - 2,
+        cost=0.0008,
+        seed=7,
+        train_end=300,
+        dd_inc=2.0,
+        dd_level=0.1,
+    )
+
+
 def test_stepwise_reward_matches_batch_shape_rewards():
     panel = _panel()
-    cfg = ResetCfg(start=180, end=len(panel) - 2, cost=0.0008, seed=7, train_end=300)
+    cfg = _reward_cfg(panel)
     env = OverlayEnv(panel, cfg)
     env.reset(cfg)
     n_steps = env.end - cfg.start
@@ -29,32 +51,51 @@ def test_stepwise_reward_matches_batch_shape_rewards():
         env.lev[sl],
         env.vol[sl],
         cfg.cost,
-        eta=cfg.eta,
+        down_lambda=cfg.down_lambda,
         dd_inc=cfg.dd_inc,
         dd_level=cfg.dd_level,
         clip=cfg.clip,
-        so_w=cfg.so_w,
     )
     ref_pnl = bar_pnl(actions, env.y[sl], env.lev[sl], cfg.cost)
     ref_rew = shape_rewards(
         ref_pnl,
         env.vol[sl],
-        eta=cfg.eta,
+        down_lambda=cfg.down_lambda,
         dd_inc=cfg.dd_inc,
         dd_level=cfg.dd_level,
         clip=cfg.clip,
-        so_w=cfg.so_w,
     )
     np.testing.assert_allclose(pnl, ref_pnl, atol=1e-12)
     np.testing.assert_allclose(rew, ref_rew, atol=1e-6)
 
 
-def test_overlay_env_stepwise_matches_batch():
+def test_rust_reward_matches_python():
+    """Rust 不再在训练路径上，但两份实现必须保持一致，否则 golden 会悄悄失真。"""
     panel = _panel()
-    cfg = ResetCfg(start=180, end=len(panel) - 2, cost=0.0008, seed=7, train_end=300)
+    cfg = _reward_cfg(panel)
     env = OverlayEnv(panel, cfg)
     env.reset(cfg)
-    n_steps = cfg.end - cfg.start
+    n_steps = env.end - cfg.start
+    actions = np.tanh(np.sin(np.arange(n_steps, dtype=np.float64) / 11.0))
+    sl = slice(cfg.start, cfg.start + n_steps)
+    kw = dict(
+        down_lambda=cfg.down_lambda, dd_inc=cfg.dd_inc, dd_level=cfg.dd_level, clip=cfg.clip
+    )
+    got = overlay_rewards_rust(actions, env.y[sl], env.lev[sl], env.vol[sl], cfg.cost, **kw)
+    if got is None:
+        pytest.skip("betatrend_env extension not built")
+    rust_pnl, rust_rew = got
+    py_pnl, py_rew = overlay_rewards(actions, env.y[sl], env.lev[sl], env.vol[sl], cfg.cost, **kw)
+    np.testing.assert_allclose(rust_pnl, py_pnl, atol=1e-12)
+    np.testing.assert_allclose(rust_rew, py_rew, atol=1e-6)
+
+
+def test_overlay_env_stepwise_matches_batch():
+    panel = _panel()
+    cfg = _reward_cfg(panel)
+    env = OverlayEnv(panel, cfg)
+    env.reset(cfg)
+    n_steps = int(cfg.end or 0) - cfg.start
     actions = np.tanh(np.sin(np.arange(n_steps, dtype=np.float64) / 11.0))
     rews = []
     for a in actions:
@@ -69,11 +110,10 @@ def test_overlay_env_stepwise_matches_batch():
         env.lev[sl],
         env.vol[sl],
         cfg.cost,
-        eta=cfg.eta,
+        down_lambda=cfg.down_lambda,
         dd_inc=cfg.dd_inc,
         dd_level=cfg.dd_level,
         clip=cfg.clip,
-        so_w=cfg.so_w,
     )
     np.testing.assert_allclose(rews, batch, atol=1e-6)
 

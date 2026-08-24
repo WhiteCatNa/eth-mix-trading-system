@@ -38,15 +38,13 @@ struct Msg {
     #[serde(default)]
     cost: Option<f64>,
     #[serde(default)]
-    eta: Option<f64>,
+    down_lambda: Option<f64>,
     #[serde(default)]
     dd_inc: Option<f64>,
     #[serde(default)]
     dd_level: Option<f64>,
     #[serde(default)]
     clip: Option<f64>,
-    #[serde(default)]
-    so_w: Option<f64>,
 }
 
 fn flags5(v: Option<Vec<bool>>) -> Option<[bool; 5]> {
@@ -138,11 +136,10 @@ fn main() {
                         &lev,
                         &vol,
                         msg.cost.unwrap_or(0.0008),
-                        msg.eta.unwrap_or(1.0 / 72.0),
-                        msg.dd_inc.unwrap_or(1.0),
-                        msg.dd_level.unwrap_or(0.05),
+                        msg.down_lambda.unwrap_or(0.5),
+                        msg.dd_inc.unwrap_or(0.0),
+                        msg.dd_level.unwrap_or(0.0),
                         msg.clip.unwrap_or(5.0),
-                        msg.so_w.unwrap_or(1.0),
                     );
                     serde_json::json!({"pnl": pnl, "reward": rew})
                 }

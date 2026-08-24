@@ -36,18 +36,17 @@ fn flatten_matrix(mat: Vec<Vec<f64>>) -> PyResult<(Vec<f64>, usize)> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (actions, y, lev, vol_ann, cost, eta, dd_inc, dd_level, clip, so_w=1.0))]
+#[pyo3(signature = (actions, y, lev, vol_ann, cost, down_lambda=0.5, dd_inc=0.0, dd_level=0.0, clip=5.0))]
 fn overlay_rewards(
     actions: Vec<f64>,
     y: Vec<f64>,
     lev: Vec<f64>,
     vol_ann: Vec<f64>,
     cost: f64,
-    eta: f64,
+    down_lambda: f64,
     dd_inc: f64,
     dd_level: f64,
     clip: f64,
-    so_w: f64,
 ) -> (Vec<f64>, Vec<f64>) {
     rust_overlay_rewards(
         &actions,
@@ -55,11 +54,10 @@ fn overlay_rewards(
         &lev,
         &vol_ann,
         cost,
-        eta,
+        down_lambda,
         dd_inc,
         dd_level,
         clip,
-        so_w,
     )
 }
 

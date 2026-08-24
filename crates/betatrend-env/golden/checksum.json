@@ -1,5 +1,5 @@
 {
-  "max_step_vs_batch_reward_abs": 2.102611853516123e-07,
+  "max_step_vs_batch_reward_abs": 5.664889801693107e-08,
   "n_steps": 218,
   "n_feat": 42
 }
