@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>BETA-TREND · ETHUSDT</title>
+<style>
+  :root {
+    --bg: #131722;
+    --panel: #1e222d;
+    --line: #2a2e39;
+    --text: #d1d4dc;
+    --muted: #787b86;
+    --green: #26a69a;
+    --red: #ef5350;
+    --blue: #2962ff;
+    --warn: #e6b450;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 "Trebuchet MS", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+    border-bottom: 1px solid var(--line); background: #0f131a; flex-wrap: wrap;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: 0.04em; }
+  header .sub { color: var(--muted); }
+  select, button {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 4px; padding: 4px 8px; font: inherit; cursor: pointer;
+  }
+  button.active { border-color: var(--blue); color: #fff; background: #1b2a4a; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tabs { margin-left: auto; display: flex; gap: 4px; }
+  .layout { flex: 1; display: grid; grid-template-columns: 1fr 320px; min-height: 0; }
+  .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .charts { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+  #price { flex: 1.6; min-height: 220px; }
+  #equity { flex: 1; min-height: 160px; border-top: 1px solid var(--line); }
+  aside {
+    border-left: 1px solid var(--line); background: #161a22;
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 10px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 8px; }
+  .stat .k { color: var(--muted); font-size: 11px; }
+  .stat .v { font-size: 15px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .stat .v.up { color: var(--green); }
+  .stat .v.down { color: var(--red); }
+  .note { color: var(--warn); font-size: 11px; padding: 0 10px 8px; }
+  .fills { flex: 1; overflow: auto; border-top: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: #161a22; }
+  td:nth-child(1), td:nth-child(2), td:nth-child(3),
+  th:nth-child(1), th:nth-child(2), th:nth-child(3) { text-align: left; }
+  tr.buy td:nth-child(3) { color: var(--green); }
+  tr.sell td:nth-child(3) { color: var(--red); }
+  .up { color: var(--green); }
+  .down { color: var(--red); }
+  #live { display: none; flex: 1; min-height: 0; width: 100%; }
+  #live.open { display: block; height: 100%; }
+  #tv-live { height: 100%; min-height: 480px; }
+  .charts.hide { display: none; }
+  .legend { display: flex; gap: 12px; padding: 4px 12px; color: var(--muted); font-size: 11px; }
+  .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 1px; margin-right: 4px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>BETA-TREND</h1>
+    <span class="sub" id="sym">ETHUSDT · 1h</span>
+    <select id="report"></select>
+    <div class="chips" id="chips"></div>
+    <label class="sub"><input type="checkbox" id="logeq"/> 净值对数轴</label>
+    <div class="tabs">
+      <button class="active" id="tab-bt" type="button">回测叠加</button>
+      <button id="tab-tv" type="button">TradingView 实盘</button>
+    </div>
+  </header>
+  <div class="layout">
+    <div class="main">
+      <div class="charts" id="bt-view">
+        <div class="legend">
+          <span><i style="background:#26a69a"></i>BUY / 多</span>
+          <span><i style="background:#ef5350"></i>SELL / 空</span>
+          <span>收盘信号 · 下一根开盘成交 · 起点 100,000 USDT</span>
+          <span id="range-label"></span>
+        </div>
+        <div id="price"></div>
+        <div id="equity"></div>
+      </div>
+      <div id="live"></div>
+    </div>
+    <aside>
+      <div class="stats" id="stats"></div>
+      <div class="note" id="note"></div>
+      <div class="fills">
+        <table>
+          <thead>
+            <tr><th>#</th><th>UTC</th><th>方向</th><th>动作</th><th>价格</th><th>ETH</th><th>净盈亏</th></tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </aside>
+  </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://s3.tradingview.com/tv.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+let report = params.get("report") || "eval_grpo_fold40";
+let meta = null;
+let priceChart, eqChart, candleSeries, volSeries, eqSeries;
+let syncing = false;
+let tvMounted = false;
+let visible = { start: null, end: null };
+
+function fmt(n, d=2) {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  const sign = n < 0 ? "−" : "";
+  if (abs >= 1e6) return sign + (abs/1e6).toFixed(2) + "M";
+  if (abs >= 1e3) return sign + (abs/1e3).toFixed(1) + "k";
+  return sign + abs.toFixed(d);
+}
+function pct(n) {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const s = (n * 100).toFixed(2) + "%";
+  return n < 0 ? s.replace("-", "−") : "+" + s;
+}
+function iso(sec) { return new Date(sec * 1000).toISOString().replace(".000", ""); }
+function utcLabel(sec) {
+  const d = new Date(sec * 1000);
+  const p = (x) => String(x).padStart(2, "0");
+  return `${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+
+function chartOpts(extra) {
+  return Object.assign({
+    layout: { background: { color: "#131722" }, textColor: "#d1d4dc" },
+    grid: { vertLines: { color: "#1e222d" }, horzLines: { color: "#1e222d" } },
+    rightPriceScale: { borderColor: "#2a2e39" },
+    timeScale: { borderColor: "#2a2e39", timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    handleScroll: { vertTouchDrag: false },
+  }, extra || {});
+}
+
+function mountCharts() {
+  priceChart = LightweightCharts.createChart($("price"), chartOpts());
+  candleSeries = priceChart.addCandlestickSeries({
+    upColor: "#26a69a", downColor: "#ef5350",
+    borderVisible: false, wickUpColor: "#26a69a", wickDownColor: "#ef5350",
+  });
+  volSeries = priceChart.addHistogramSeries({
+    priceFormat: { type: "volume" }, priceScaleId: "vol",
+  });
+  priceChart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  eqChart = LightweightCharts.createChart($("equity"), chartOpts());
+  eqSeries = eqChart.addAreaSeries({
+    lineColor: "#2962ff", topColor: "rgba(41,98,255,0.28)", bottomColor: "rgba(41,98,255,0.02)",
+    lineWidth: 2,
+  });
+  const sizeCharts = () => {
+    priceChart.applyOptions({ width: $("price").clientWidth, height: $("price").clientHeight });
+    eqChart.applyOptions({ width: $("equity").clientWidth, height: $("equity").clientHeight });
+  };
+  sizeCharts();
+  requestAnimationFrame(sizeCharts);
+  const sync = (src, dst) => {
+    src.timeScale().subscribeVisibleTimeRangeChange((r) => {
+      if (!r || syncing) return;
+      syncing = true;
+      try { dst.timeScale().setVisibleRange(r); } catch (e) {}
+      syncing = false;
+      if (src === priceChart) onRange(r);
+    });
+  };
+  sync(priceChart, eqChart);
+  sync(eqChart, priceChart);
+  window.addEventListener("resize", () => {
+    priceChart.applyOptions({ width: $("price").clientWidth, height: $("price").clientHeight });
+    eqChart.applyOptions({ width: $("equity").clientWidth, height: $("equity").clientHeight });
+  });
+}
+
+let rangeTimer = 0;
+function onRange(r) {
+  visible = r;
+  $("range-label").textContent = r ? (utcLabel(r.from) + " → " + utcLabel(r.to)) : "";
+  clearTimeout(rangeTimer);
+  rangeTimer = setTimeout(() => loadFills(r.from, r.to, false), 180);
+}
+
+async function jget(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(path + " " + r.status);
+  return r.json();
+}
+
+function statCell(k, v, cls) {
+  return `<div class="stat"><div class="k">${k}</div><div class="v ${cls||""}">${v}</div></div>`;
+}
+
+function renderMeta() {
+  const m = meta.metrics || {};
+  const ret = m.total_return, sh = m.sharpe, dd = m.max_drawdown;
+  $("stats").innerHTML = [
+    statCell("期末权益", fmt(m.final_equity, 0), ret >= 0 ? "up" : "down"),
+    statCell("总收益", pct(ret), ret >= 0 ? "up" : "down"),
+    statCell("Sharpe", sh == null ? "—" : Number(sh).toFixed(2), sh >= 0 ? "up" : "down"),
+    statCell("最大回撤", pct(dd), "down"),
+    statCell("成交笔数", (m.n_fills ?? meta.n_fills).toLocaleString()),
+    statCell("初始资金", "100,000 USDT"),
+  ].join("");
+  $("note").textContent = meta.note || "";
+  const sel = $("report");
+  sel.innerHTML = (meta.reports || []).map(r =>
+    `<option value="${r.name}" ${r.name===report?"selected":""}>${r.name}</option>`
+  ).join("");
+  $("chips").innerHTML = (meta.presets || []).map(p =>
+    `<button type="button" data-start="${p.start}" data-end="${p.end}" data-id="${p.id}">${p.label}</button>`
+  ).join("");
+  $("chips").onclick = (ev) => {
+    const b = ev.target.closest("button");
+    if (!b) return;
+    [...$("chips").children].forEach(x => x.classList.toggle("active", x === b));
+    applyRange(Number(b.dataset.start), Number(b.dataset.end), true);
+  };
+}
+
+async function applyRange(start, end, fit) {
+  visible = { from: start, to: end };
+  const q = `report=${encodeURIComponent(report)}&start=${encodeURIComponent(iso(start))}&end=${encodeURIComponent(iso(end))}`;
+  const [ohlc, eq] = await Promise.all([
+    jget(`/api/ohlcv?${q}`),
+    jget(`/api/equity?${q}`),
+  ]);
+  const candles = ohlc.t.map((t,i) => ({ time: t, open: ohlc.o[i], high: ohlc.h[i], low: ohlc.l[i], close: ohlc.c[i] }));
+  const vols = ohlc.t.map((t,i) => ({
+    time: t, value: ohlc.v[i],
+    color: ohlc.c[i] >= ohlc.o[i] ? "rgba(38,166,154,0.35)" : "rgba(239,83,80,0.35)",
+  }));
+  candleSeries.setData(candles);
+  volSeries.setData(vols);
+  eqSeries.setData((eq.t || []).map((t,i) => ({ time: t, value: eq.eq[i] })));
+  if (fit && candles.length) {
+    syncing = true;
+    try {
+      priceChart.timeScale().setVisibleRange({ from: start, to: end });
+      eqChart.timeScale().setVisibleRange({ from: start, to: end });
+    } catch (e) {}
+    syncing = false;
+  }
+  await loadFills(start, end, true);
+}
+
+async function loadFills(start, end, allIfShort) {
+  const span = (end - start) / 86400;
+  const all = allIfShort && span <= 60 ? "&all=1" : "";
+  const q = `report=${encodeURIComponent(report)}&start=${encodeURIComponent(iso(start))}&end=${encodeURIComponent(iso(end))}${all}`;
+  const data = await jget(`/api/fills?${q}`);
+  const rows = data.rows || [];
+  candleSeries.setMarkers(rows.map(r => ({
+    time: r.t,
+    position: r.side === "BUY" ? "belowBar" : "aboveBar",
+    color: r.side === "BUY" ? "#26a69a" : "#ef5350",
+    shape: r.side === "BUY" ? "arrowUp" : "arrowDown",
+    text: (span <= 8 && rows.length <= 24) ? r.action : "",
+  })));
+  const body = $("tbody");
+  body.innerHTML = rows.slice().reverse().slice(0, 400).map(r => {
+    const cls = r.side === "BUY" ? "buy" : "sell";
+    const netCls = r.net >= 0 ? "up" : "down";
+    return `<tr class="${cls}"><td>${r.n}</td><td>${utcLabel(r.t)}</td><td>${r.side}</td><td>${r.action}</td><td>${r.px.toFixed(2)}</td><td>${r.qty>=0?"+":""}${r.qty.toFixed(2)}</td><td class="${netCls}">${fmt(r.net)}</td></tr>`;
+  }).join("");
+  $("range-label").textContent =
+    utcLabel(start) + " → " + utcLabel(end) +
+    ` · 成交 ${data.shown}/${data.total}` + (data.truncated ? "（宽窗口已按 |净盈亏| 截断）" : "");
+}
+
+function mountLive() {
+  if (tvMounted || typeof TradingView === "undefined") return;
+  $("live").innerHTML = '<div id="tv-live" style="height:100%;width:100%"></div>';
+  new TradingView.widget({
+    autosize: true,
+    symbol: (meta && meta.tv_symbol) || "BINANCE:ETHUSDT.P",
+    interval: "60",
+    timezone: "Etc/UTC",
+    theme: "dark",
+    style: "1",
+    locale: "zh_CN",
+    hide_legend: false,
+    enable_publishing: false,
+    allow_symbol_change: true,
+    container_id: "tv-live",
+    studies: ["Volume@tv-basicstudies"],
+  });
+  tvMounted = true;
+}
+
+async function boot() {
+  mountCharts();
+  meta = await jget(`/api/meta?report=${encodeURIComponent(report)}`);
+  $("sym").textContent = `${meta.symbol} · ${meta.interval}m · UTC`;
+  renderMeta();
+  $("report").onchange = () => {
+    report = $("report").value;
+    history.replaceState(null, "", `/?report=${encodeURIComponent(report)}`);
+    location.reload();
+  };
+  $("logeq").onchange = () => {
+    eqChart.priceScale("right").applyOptions({ mode: $("logeq").checked ? 1 : 0 });
+  };
+  $("tab-bt").onclick = () => {
+    $("tab-bt").classList.add("active"); $("tab-tv").classList.remove("active");
+    $("bt-view").classList.remove("hide"); $("live").classList.remove("open");
+  };
+  $("tab-tv").onclick = () => {
+    $("tab-tv").classList.add("active"); $("tab-bt").classList.remove("active");
+    $("bt-view").classList.add("hide"); $("live").classList.add("open");
+    mountLive();
+  };
+  const oos = (meta.presets || []).find(p => p.id === "oos") || (meta.presets || [])[0];
+  if (oos) {
+    const btn = [...$("chips").children].find(b => b.dataset.id === oos.id);
+    if (btn) btn.classList.add("active");
+    await applyRange(oos.start, oos.end, true);
+  }
+}
+boot().catch((e) => { $("note").textContent = String(e); });
+</script>
+</body>
+</html>

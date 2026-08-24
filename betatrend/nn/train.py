@@ -34,6 +34,7 @@ from betatrend.nn.dataset import (
     build_feature_frame,
     execution_aligned_returns,
     make_windows,
+    shuffle_rebalance_index,
     sizing_vol,
     vol_leverage,
 )
@@ -88,18 +89,22 @@ def _grpo_rollout(
     vol_ann: np.ndarray,
     cost: float,
     cfg: StrategyCfg,
+    rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """在每个再平衡点采 G 个动作，用窗口总奖励做组内相对优势。
 
-    观测不含仓位，所以所有再平衡点可以先一批采样；奖励仍按成交路径顺序算，
-    因为换手取决于上一窗口结束时的暴露。返回的 index 指向再平衡 bar。
-    第 0 号组成员真正成交，用来推进 EMA / 暴露。
+    观测不含仓位，所以所有再平衡点可以先一批采样；奖励仍按访问顺序推进
+    EMA / 暴露（换手依赖上一窗口结束时的仓位）。``rng`` 非空时打乱再平衡点
+    的先后，每个点的 8h 收益窗仍是原来的连续 bar。
     """
     net.eval()
     n = int(obs.shape[0])
     hold = desk_hold_bars(cfg)
     group = max(int(cfg.grpo_group_size), 2)
-    reb = np.arange(0, n, hold, dtype=np.int64)
+    if rng is None:
+        reb = np.arange(0, n, hold, dtype=np.int64)
+    else:
+        reb = shuffle_rebalance_index(n, hold, rng)
     action_g, logp_g = net.sample_group(obs.index_select(0, torch.from_numpy(reb)), group)
     action_g = action_g.cpu().numpy()
     logp_g = logp_g.cpu().numpy()
@@ -258,20 +263,23 @@ def _train_one(
     epochs = max(int(cfg.nn_epochs), 1)
     replay = ReplayBuffer(n_rollouts=int(cfg.ppo_replay_rollouts))
     ckpt_every = int(getattr(cfg, "nn_ckpt_every", 0) or 0)
+    shuffle = bool(getattr(cfg, "nn_shuffle", True))
+    rng = np.random.default_rng(int(seed) + 17) if shuffle else None
     # 观测在整段训练里不变：转一次张量，之后 rollout 切片和 minibatch 都只做 index_select
     obs = torch.from_numpy(np.ascontiguousarray(windows, dtype=np.float32))
     logger.info(
-        "GRPO start seed={} n={} epochs={} group={} inner={} replay={} warm_start={}",
+        "GRPO start seed={} n={} epochs={} group={} inner={} replay={} shuffle={} warm_start={}",
         seed,
         len(windows),
         epochs,
         max(int(cfg.grpo_group_size), 2),
         inner,
         replay.n_rollouts,
+        shuffle,
         init_state is not None,
     )
     for ep in range(epochs):
-        rows, actions, logps, adv, mean_r = _grpo_rollout(net, obs, yc, lev, vol_ann, cost, cfg)
+        rows, actions, logps, adv, mean_r = _grpo_rollout(net, obs, yc, lev, vol_ann, cost, cfg, rng=rng)
         replay.add(rows, actions, logps, adv)
         _grpo_update(net, opt, obs, replay.packed(), cfg, inner)
         step = ep + 1
@@ -464,6 +472,86 @@ def _overlay_metrics(y, pos, lev, cost, steps_per_year) -> dict:
     }
 
 
+def fold_ckpt_path(prefix: Path, fold_id: int, seed: int, step: int) -> Path:
+    """``eth_decision_fold{id}_s{seed}_e{step}.pt``，和 ``_train_one`` 中途落盘同名。"""
+    prefix = Path(prefix)
+    return prefix.with_name(f"{prefix.stem}_fold{int(fold_id)}_s{int(seed)}_e{int(step)}{prefix.suffix}")
+
+
+def fold_seed(fold: int, seed_i: int) -> int:
+    return 7 + int(seed_i) + int(fold) * 17
+
+
+def latest_complete_fold(prefix: Path, n_seeds: int, epochs: int) -> int:
+    """从 0 起连续找齐了 n_seeds 个 e{epochs} 文件的最后一折。没有则 -1。"""
+    last = -1
+    fold = 0
+    n_seeds = max(int(n_seeds), 1)
+    epochs = max(int(epochs), 1)
+    while True:
+        paths = [fold_ckpt_path(prefix, fold, fold_seed(fold, s), epochs) for s in range(n_seeds)]
+        if all(p.is_file() for p in paths):
+            last = fold
+            fold += 1
+            continue
+        break
+    return last
+
+
+def _load_ckpt_state(path: Path) -> dict:
+    blob = torch.load(Path(path), map_location="cpu", weights_only=False)
+    states = blob.get("states") or []
+    if not states:
+        raise ValueError(f"checkpoint has no states: {path}")
+    return states[0]
+
+
+def _actor_from_ckpt(path: Path) -> tuple[GRPOActor, dict]:
+    blob = torch.load(Path(path), map_location="cpu", weights_only=False)
+    net = GRPOActor(
+        n_feat=int(blob.get("n_feat") or N_FEAT),
+        seq_len=int(blob.get("seq_len") or SEQ_LEN),
+        dropout=float(blob.get("dropout", 0.2)),
+    )
+    states = blob.get("states") or []
+    if not states:
+        raise ValueError(f"checkpoint has no states: {path}")
+    net.load_state_dict(states[0])
+    net.eval()
+    return net, blob
+
+
+def _replay_completed_oos(
+    oos_nn: np.ndarray,
+    x_all: np.ndarray,
+    folds: list[tuple[int, np.ndarray, np.ndarray]],
+    *,
+    start_fold: int,
+    path: Path,
+    n_seeds: int,
+    epochs: int,
+    seq_len: int,
+) -> None:
+    """用已落盘的折权重回放跳过折的测试预测，好让最终 walk-forward OOS 仍然完整。"""
+    for fold, _tr, te in folds:
+        if fold >= start_fold:
+            break
+        preds: list[np.ndarray] = []
+        win = None
+        for s in range(n_seeds):
+            ckpt = fold_ckpt_path(path, fold, fold_seed(fold, s), epochs)
+            if not ckpt.is_file():
+                raise FileNotFoundError(f"missing fold checkpoint for OOS replay: {ckpt}")
+            net, blob = _actor_from_ckpt(ckpt)
+            if win is None:
+                median = np.asarray(blob["median"], dtype=np.float32)
+                iqr = np.asarray(blob["iqr"], dtype=np.float32)
+                win = make_windows(_robust_scale(x_all, median, iqr), seq_len=seq_len)
+            preds.append(_predict(net, win[np.asarray(te, dtype=int)]))
+        oos_nn[np.asarray(te)] = np.mean(np.stack(preds, axis=0), axis=0).reshape(-1)
+        logger.info("replayed OOS fold {}/{}", fold + 1, len(folds))
+
+
 def walk_forward_folds(
     n: int,
     *,
@@ -623,6 +711,8 @@ def train_decision_net(
     purge: int = 24,
     prod_holdout: int | None = None,
     min_valid: int = 800,
+    start_fold: int | None = None,
+    resume: bool = False,
 ) -> TrainResult:
     cfg = settings.strategy
     seq_len = int(cfg.seq_len) if cfg.seq_len else SEQ_LEN
@@ -661,6 +751,11 @@ def train_decision_net(
         max(int(cfg.nn_epochs), 1),
     )
     n_seeds = max(int(cfg.nn_seeds), 1)
+    epochs = max(int(cfg.nn_epochs), 1)
+    if resume and start_fold is None:
+        start_fold = latest_complete_fold(path, n_seeds, epochs) + 1
+    start_fold = 0 if start_fold is None else int(start_fold)
+    start_fold = max(0, min(start_fold, len(folds)))
     n_jobs, threads_per_job = resolve_seed_jobs(cfg, n_seeds)
     _bind_shared(x_all, y_all, lev_all, vol_all)
     pool = None
@@ -674,7 +769,33 @@ def train_decision_net(
         logger.info("seed parallelism: jobs={} threads/job={} seeds={}", n_jobs, threads_per_job, n_seeds)
     try:
         prev_states: list[dict | None] = [None] * n_seeds
+        if start_fold > 0:
+            prev_fold = start_fold - 1
+            for s in range(n_seeds):
+                ckpt = fold_ckpt_path(path, prev_fold, fold_seed(prev_fold, s), epochs)
+                if not ckpt.is_file():
+                    raise FileNotFoundError(f"resume needs {ckpt}")
+                prev_states[s] = _load_ckpt_state(ckpt)
+            logger.info(
+                "resume from fold {}/{} warm_start=fold{} shuffle={}",
+                start_fold + 1,
+                len(folds),
+                prev_fold,
+                bool(getattr(cfg, "nn_shuffle", True)),
+            )
+            _replay_completed_oos(
+                oos_nn,
+                x_all,
+                folds,
+                start_fold=start_fold,
+                path=path,
+                n_seeds=n_seeds,
+                epochs=epochs,
+                seq_len=seq_len,
+            )
         for fold, tr_h, te in folds:
+            if fold < start_fold:
+                continue
             logger.info(
                 "fold {}/{} train_idx=[{}, {}) n_train={} n_test={} warm_start={}",
                 fold + 1,

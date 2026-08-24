@@ -113,6 +113,7 @@ class StrategyCfg(BaseModel):
     nn_cost_bps: float = 8.0
     nn_epochs: int = 80
     nn_patience: int = 12
+    nn_shuffle: bool = True  # 每个 epoch 打乱 8h 再平衡样本顺序；窗内时间顺序不变
     seq_len: int = 7
     ppo_gamma: float = 0.99
     ppo_gae_lambda: float = 0.95

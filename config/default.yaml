@@ -53,6 +53,7 @@ strategy:
   nn_cost_bps: 8.0
   nn_epochs: 80
   nn_patience: 12
+  nn_shuffle: true  # 每个 epoch 打乱 8h 再平衡块顺序；块内 K 线与因果窗口不拆
   seq_len: 7
   ppo_clip: 0.2
   ppo_ent_coef: 0.01

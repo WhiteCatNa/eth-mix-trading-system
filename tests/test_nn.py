@@ -141,6 +141,34 @@ def test_feature_window_is_seven_by_n_feat():
     np.testing.assert_allclose(last, windows[-1], atol=1e-6)
 
 
+def test_shuffle_rebalance_index_permutes_hold_grid():
+    from betatrend.nn.dataset import shuffle_rebalance_index
+
+    hold = 8
+    n = 100
+    base = np.arange(0, n, hold)
+    a = shuffle_rebalance_index(n, hold, np.random.default_rng(0))
+    b = shuffle_rebalance_index(n, hold, np.random.default_rng(1))
+    assert sorted(a.tolist()) == base.tolist()
+    assert sorted(b.tolist()) == base.tolist()
+    assert not np.array_equal(a, b)
+    np.testing.assert_array_equal(shuffle_rebalance_index(5, hold, np.random.default_rng(0)), [0])
+
+
+def test_latest_complete_fold_stops_at_first_gap(tmp_path):
+    from betatrend.nn.train import fold_ckpt_path, fold_seed, latest_complete_fold
+
+    prefix = tmp_path / "eth_decision.pt"
+    assert latest_complete_fold(prefix, n_seeds=3, epochs=80) == -1
+    for fold in range(2):
+        for s in range(3):
+            p = fold_ckpt_path(prefix, fold, fold_seed(fold, s), 80)
+            p.write_bytes(b"x")
+    assert latest_complete_fold(prefix, n_seeds=3, epochs=80) == 1
+    fold_ckpt_path(prefix, 2, fold_seed(2, 0), 80).write_bytes(b"x")
+    assert latest_complete_fold(prefix, n_seeds=3, epochs=80) == 1
+
+
 def test_new_regime_features_are_present():
     for name in ("funding_z", "funding_d8", "range_pos", "ret_streak", "trend_persist", "close_z"):
         assert name in FEATURE_NAMES
