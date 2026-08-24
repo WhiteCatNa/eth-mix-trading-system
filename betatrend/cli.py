@@ -1,6 +1,7 @@
 """命令行：拉行情、回测、训练、paper、探活。
 
-``python -m betatrend <子命令>``。研究 / paper / 实盘共用 DeskCycle。
+``python -m betatrend <子命令>``。研究 / paper 共用 DeskCycle。
+本 CLI 不发送签名订单；``ping --signed`` 只读账户。
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from betatrend.logutil import setup_logging
 from betatrend.marketdata import BinancePublicClient
 from betatrend.marketdata.store import MarketDataStore
 from betatrend.research import paper_once, paper_run, run_backtest, train_nn
+from pathlib import Path
 
 console = Console()
 
@@ -109,6 +111,75 @@ def cmd_train_nn(args) -> int:
     return 0
 
 
+def _load_panel(args, settings):
+    import pandas as pd
+
+    if getattr(args, "panel", None):
+        p = Path(args.panel)
+        if p.suffix.lower() == ".csv":
+            return pd.read_csv(p, index_col=0, parse_dates=True)
+        return pd.read_parquet(p)
+    store = MarketDataStore(settings)
+    panels = store.load_universe(
+        lookback_days=getattr(args, "days", None) or settings.data.lookback_days,
+        force_demo=bool(getattr(args, "demo", False)),
+        refresh=False,
+    )
+    symbol = settings.universe.trade_symbol
+    if symbol not in panels:
+        raise KeyError(f"{symbol} missing from loaded panels")
+    return panels[symbol]
+
+
+def cmd_train_fold(args) -> int:
+    settings = _settings(args)
+    setup_logging(settings)
+    from betatrend.nn.train import list_fold_jobs, train_fold
+
+    panel = _load_panel(args, settings)
+    cfg = settings.strategy
+    jobs = list_fold_jobs(len(panel), cfg)
+    if args.job_json:
+        job = json.loads(Path(args.job_json).read_text(encoding="utf-8"))
+    else:
+        picked = [j for j in jobs if j["fold_id"] == args.fold and j["seed"] == args.seed]
+        if not picked:
+            raise SystemExit(f"no job for fold={args.fold} seed={args.seed}; {len(jobs)} jobs listed")
+        job = picked[0]
+    train_idx = list(range(int(job["train_start"]), int(job["train_end"])))
+    test_idx = None
+    if job.get("test_start") is not None:
+        test_idx = list(range(int(job["test_start"]), int(job["test_end"])))
+    out = Path(args.out) if args.out else ROOT / "models" / f"fold{job['fold_id']}_seed{job['seed']}.pt"
+    result = train_fold(
+        panel,
+        settings,
+        train_idx=train_idx,
+        test_idx=test_idx,
+        fold_id=int(job["fold_id"]),
+        seed=int(job["seed"]),
+        path=out,
+    )
+    console.print_json(json.dumps({k: v for k, v in result.items() if k != "pred_te"}, default=str))
+    return 0
+
+
+def cmd_train_fold_jobs(args) -> int:
+    settings = _settings(args)
+    setup_logging(settings)
+    from betatrend.nn.train import list_fold_jobs
+
+    panel = _load_panel(args, settings)
+    jobs = list_fold_jobs(len(panel), settings.strategy)
+    text = json.dumps(jobs, indent=2)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        console.print(f"wrote {args.out} ({len(jobs)} jobs)")
+    else:
+        console.print_json(text)
+    return 0
+
+
 def cmd_paper_once(args) -> int:
     settings = _settings(args)
     setup_logging(settings)
@@ -148,9 +219,17 @@ def cmd_ping(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="betatrend", description="BETA-TREND ETH timing")
+    p = argparse.ArgumentParser(
+        prog="betatrend",
+        description="BETA-TREND ETH timing (research/paper CLI; does not place signed orders)",
+    )
     p.add_argument("--config", type=str, default=None)
-    p.add_argument("--mode", choices=["research", "paper", "testnet", "live"], default=None)
+    p.add_argument(
+        "--mode",
+        choices=["research", "paper", "testnet", "live"],
+        default=None,
+        help="Sets account.mode. paper/backtest still use the local broker.",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("version").set_defaults(func=cmd_version)
@@ -174,20 +253,37 @@ def build_parser() -> argparse.ArgumentParser:
     tn.add_argument("--path", type=str, default=None)
     tn.set_defaults(func=cmd_train_nn)
 
-    po = sub.add_parser("paper-once")
+    tf = sub.add_parser("train-fold", help="Train one walk-forward fold × seed (distributed worker)")
+    tf.add_argument("--days", type=int, default=None)
+    tf.add_argument("--demo", action="store_true")
+    tf.add_argument("--panel", type=str, default=None, help="Parquet/CSV panel; default loads via MarketDataStore")
+    tf.add_argument("--fold", type=int, default=0)
+    tf.add_argument("--seed", type=int, default=7)
+    tf.add_argument("--job-json", type=str, default=None)
+    tf.add_argument("--out", type=str, default=None)
+    tf.set_defaults(func=cmd_train_fold)
+
+    tj = sub.add_parser("train-fold-jobs", help="Print JSON list of independent fold+seed jobs")
+    tj.add_argument("--days", type=int, default=None)
+    tj.add_argument("--demo", action="store_true")
+    tj.add_argument("--panel", type=str, default=None)
+    tj.add_argument("--out", type=str, default=None)
+    tj.set_defaults(func=cmd_train_fold_jobs)
+
+    po = sub.add_parser("paper-once", help="Latest completed T+1 cycle (signal at t close, fill at t+1 open)")
     po.add_argument("--demo", action="store_true")
-    po.add_argument("--execute", action="store_true")
+    po.add_argument("--execute", action="store_true", help="Fill locally at next open; overrides paper.dry_run")
     po.set_defaults(func=cmd_paper_once)
 
-    pr = sub.add_parser("paper-run")
+    pr = sub.add_parser("paper-run", help="Replay bars locally; persists last_reb / pending / EMA")
     pr.add_argument("--demo", action="store_true")
     pr.add_argument("--bars", type=int, default=24)
-    pr.add_argument("--execute", action="store_true")
+    pr.add_argument("--execute", action="store_true", help="Fill locally; overrides paper.dry_run")
     pr.add_argument("--reset-state", action="store_true")
     pr.set_defaults(func=cmd_paper_run)
 
-    pg = sub.add_parser("ping")
-    pg.add_argument("--signed", action="store_true")
+    pg = sub.add_parser("ping", help="Public REST ping; --signed reads account only")
+    pg.add_argument("--signed", action="store_true", help="HMAC GET /account; does not place orders")
     pg.set_defaults(func=cmd_ping)
     return p
 

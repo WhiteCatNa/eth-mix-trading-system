@@ -22,6 +22,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
 nn = ["torch>=2.2"]
+rust = ["maturin>=1.7"]
+
+[tool.maturin]
+manifest-path = "crates/betatrend-py/Cargo.toml"
+module-name = "betatrend_env"
 
 [project.scripts]
 betatrend = "betatrend.cli:main"

@@ -86,3 +86,9 @@ def shape_rewards(
 
     shaped = np.clip(d_sharpe - dd_pen, -float(clip), float(clip))
     return shaped.astype(np.float32)
+
+
+bar_pnl = bar_pnl
+shape_rewards = shape_rewards
+bar_pnl = bar_pnl
+shape_rewards = shape_rewards

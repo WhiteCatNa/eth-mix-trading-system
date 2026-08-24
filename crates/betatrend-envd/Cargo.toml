@@ -1,0 +1,14 @@
+[package]
+name = "betatrend-envd"
+version.workspace = true
+edition.workspace = true
+description = "JSON-lines worker for remote ResetCfg / step (gRPC reserved)"
+
+[[bin]]
+name = "betatrend-envd"
+path = "src/main.rs"
+
+[dependencies]
+betatrend-env = { path = "../betatrend-env" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

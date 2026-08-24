@@ -33,14 +33,22 @@ def make_trending_panels(
     open_px = np.concatenate([[px[0]], px[:-1]])
     high = np.maximum(open_px, px) * (1.0 + rng.random(n) * 0.001)
     low = np.minimum(open_px, px) * (1.0 - rng.random(n) * 0.001)
+    volume = rng.uniform(1e3, 1e4, size=n)
     df = pd.DataFrame(
         {
             "open": open_px,
             "high": high,
             "low": low,
             "close": px,
-            "volume": rng.uniform(1e3, 1e4, size=n),
+            "volume": volume,
+            "quote_volume": volume * px,
+            "trades": rng.uniform(800, 5000, size=n),
+            "taker_buy_base": volume * rng.uniform(0.35, 0.65, size=n),
             "funding_rate": fr,
+            "mark_close": px * (1.0 + rng.normal(0.0, 0.00015, size=n)),
+            "index_close": px * (1.0 + rng.normal(0.0, 0.00008, size=n)),
+            "open_interest": np.clip(8.0e5 + np.cumsum(rng.normal(0.0, 2.0e3, size=n)), 1.0e5, None),
+            "long_short_ratio": np.clip(1.0 + rng.normal(0.0, 0.08, size=n), 0.3, 3.0),
         },
         index=idx,
     )

@@ -17,6 +17,12 @@ class FakePolicy:
     def reset(self) -> None:
         pass
 
+    def last_unit(self) -> float:
+        return float(getattr(self, "_last_unit", self.unit))
+
+    def restore_last_unit(self, unit: float) -> None:
+        self._last_unit = float(unit)
+
     def predict_unit(self, panel, *args, **kwargs) -> float:
         return self.unit
 

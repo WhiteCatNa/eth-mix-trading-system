@@ -5,7 +5,7 @@ K 次采样的轨迹，每条带着采集时的 logπ(a|s)。PPO clip 相对“�
 做重要性比，轻度 off-policy 仍有界。
 
 K=1 就是标准 PPO（只用当前 rollout）。K>1 把最近几次轨迹拼起来再打乱
-mini-batch，提高样本利用率，又不把半年前的策略混进来。
+mini-batch,提高样本利用率，又不把半年前的策略混进来。
 """
 from __future__ import annotations
 
@@ -51,3 +51,7 @@ class ReplayBuffer:
     @property
     def n_stored(self) -> int:
         return len(self._items)
+
+
+ReplayBuffer = ReplayBuffer
+ReplayBuffer = ReplayBuffer

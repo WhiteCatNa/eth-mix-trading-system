@@ -2,6 +2,8 @@
 
 密钥只从环境变量读（BINANCE_API_KEY / SECRET），不写进 YAML。
 paper/research 模式拒绝签名下单；oms.testnet_only 时禁止主网。
+凡是主网下单（client.testnet=False，含 BINANCE_TESTNET=0），不论 account.mode
+是 live 还是 testnet，都必须 BETATREND_ALLOW_LIVE=1 且 confirm=YES。
 """
 from __future__ import annotations
 
@@ -16,6 +18,16 @@ import httpx
 from loguru import logger
 
 from betatrend.config import Settings
+
+
+def require_mainnet_order_gates(settings: Settings, confirm: str) -> None:
+    """主网市价单的硬闸。testnet 客户端不要调用。"""
+    if settings.oms.testnet_only:
+        raise RuntimeError("OMS signed path is testnet-only")
+    if os.environ.get("BETATREND_ALLOW_LIVE") != "1":
+        raise RuntimeError("live trading requires BETATREND_ALLOW_LIVE=1")
+    if confirm != "YES":
+        raise RuntimeError("live trading requires confirm=YES")
 
 
 class BinanceSignedClient:
@@ -69,13 +81,8 @@ class BinanceSignedClient:
     ) -> dict:
         if self.settings.account.mode in ("research", "paper"):
             raise RuntimeError("Signed client refused: account.mode is paper")
-        if not self.testnet and self.settings.oms.testnet_only:
-            raise RuntimeError("OMS signed path is testnet-only")
-        if self.settings.account.mode == "live":
-            if os.environ.get("BETATREND_ALLOW_LIVE") != "1":
-                raise RuntimeError("live trading requires BETATREND_ALLOW_LIVE=1")
-            if confirm != "YES":
-                raise RuntimeError("live trading requires confirm=YES")
+        if not self.testnet:
+            require_mainnet_order_gates(self.settings, confirm)
         params = {
             "symbol": symbol.upper(),
             "side": side,

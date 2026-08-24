@@ -29,11 +29,27 @@ class TimingStrategy:
         self.cfg = settings.strategy
         self._policy = None
         self._policy_failed = False
+        self._smooth_unit = 0.0
 
     def reset(self) -> None:
         """清空网络 EMA（新回测 / 新 paper 会话必须调用）。"""
+        self._smooth_unit = 0.0
         if self._policy is not None:
             self._policy.reset()
+
+    def restore_smooth(self, unit: float) -> None:
+        """从 paper 状态恢复 EMA。策略网尚未加载时先记下，第一次 generate 时套上。"""
+        self._smooth_unit = float(unit)
+        if self._policy is not None and hasattr(self._policy, "restore_last_unit"):
+            self._policy.restore_last_unit(self._smooth_unit)
+
+    def last_smooth_unit(self) -> float:
+        pol = self._policy
+        if pol is not None and hasattr(pol, "last_unit"):
+            return float(pol.last_unit())
+        if pol is not None:
+            return float(getattr(pol, "_last_unit", self._smooth_unit))
+        return float(self._smooth_unit)
 
     @property
     def trade_symbol(self) -> str:
@@ -46,6 +62,8 @@ class TimingStrategy:
                 from betatrend.nn.policy import NeuralPolicy
 
                 self._policy = NeuralPolicy(self.settings)
+                if hasattr(self._policy, "restore_last_unit"):
+                    self._policy.restore_last_unit(self._smooth_unit)
             except ImportError:
                 logger.warning("torch not installed — staying flat")
                 self._policy_failed = True

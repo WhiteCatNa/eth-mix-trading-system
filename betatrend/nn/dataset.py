@@ -24,7 +24,15 @@ import pandas as pd
 #   range_pos   价格在 24h 高低点中的位置
 #   ret_streak  同向收益持续长度
 #   trend_persist 收益一阶自相关
-#   close_z     24h 收盘价 z-score（把特征维补到 30，给 [7, 30] 窗口用）
+#   close_z     24h 收盘价 z-score
+#   taker_imb*  主动买入占比（K 线 taker_buy_base / volume）
+#   body/wick   K 线实体与上下影相对振幅
+#   gap         开盘相对前收
+#   atr_n       ATR(14) / close
+#   trades_z    成交笔数 z-score
+#   basis*      标记价相对指数价溢价（完整历史）
+#   oi_*        持仓量变动 / z（期货统计接口约 30 天，更早为 0）
+#   lsr_dev     全市场多空人数比偏离 1（同上，约 30 天）
 FEATURE_NAMES = [
     "ret_1",
     "ret_4",
@@ -56,15 +64,24 @@ FEATURE_NAMES = [
     "ret_streak",
     "trend_persist",
     "close_z",
+    "taker_imb",
+    "taker_imb_ma",
+    "body",
+    "wick_imb",
+    "gap",
+    "atr_n",
+    "trades_z",
+    "basis",
+    "basis_z",
+    "oi_chg",
+    "oi_z",
+    "lsr_dev",
 ]
 
 SEQ_LEN = 7
 N_FEAT = len(FEATURE_NAMES)
 MAX_LOOKBACK = 168
 TAIL_BARS = MAX_LOOKBACK + 48
-
-if N_FEAT != 30:
-    raise RuntimeError(f"PPO observation is [7, 30]; got n_feat={N_FEAT}")
 
 
 def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
@@ -82,6 +99,7 @@ def build_feature_frame(panel: pd.DataFrame) -> pd.DataFrame:
     df.index = pd.to_datetime(df.index, utc=True)
     df = df.sort_index()
     close = df["close"].astype(float)
+    open_ = df["open"].astype(float) if "open" in df.columns else close
     high = df["high"].astype(float) if "high" in df.columns else close
     low = df["low"].astype(float) if "low" in df.columns else close
     volume = df["volume"].astype(float) if "volume" in df.columns else pd.Series(0.0, index=df.index)
@@ -131,6 +149,58 @@ def build_feature_frame(panel: pd.DataFrame) -> pd.DataFrame:
     ma = close.rolling(24, min_periods=8).mean()
     sd = close.rolling(24, min_periods=8).std().replace(0.0, np.nan)
     out["close_z"] = ((close - ma) / sd).fillna(0.0).clip(-5.0, 5.0)
+
+    span = (high - low).replace(0.0, np.nan)
+    if "taker_buy_base" in df.columns:
+        taker = df["taker_buy_base"].astype(float)
+        taker_imb = (2.0 * taker / volume.replace(0.0, np.nan) - 1.0).replace([np.inf, -np.inf], 0.0)
+        out["taker_imb"] = taker_imb.fillna(0.0).clip(-1.0, 1.0)
+    else:
+        out["taker_imb"] = 0.0
+    out["taker_imb_ma"] = out["taker_imb"].rolling(24, min_periods=8).mean().fillna(0.0)
+    out["body"] = ((close - open_) / span).replace([np.inf, -np.inf], 0.0).fillna(0.0).clip(-1.0, 1.0)
+    upper = high - np.maximum(open_, close)
+    lower = np.minimum(open_, close) - low
+    out["wick_imb"] = ((upper - lower) / span).replace([np.inf, -np.inf], 0.0).fillna(0.0).clip(-1.0, 1.0)
+    out["gap"] = (open_ / close.shift(1) - 1.0).replace([np.inf, -np.inf], 0.0).fillna(0.0).clip(-0.05, 0.05)
+    prev_c = close.shift(1)
+    true_range = pd.concat(
+        [(high - low), (high - prev_c).abs(), (low - prev_c).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr = true_range.rolling(14, min_periods=7).mean()
+    out["atr_n"] = (atr / close.replace(0.0, np.nan)).replace([np.inf, -np.inf], 0.0).fillna(0.0).clip(0.0, 0.2)
+    if "trades" in df.columns:
+        t_ma = df["trades"].astype(float).rolling(24, min_periods=8).mean()
+        t_sd = df["trades"].astype(float).rolling(24, min_periods=8).std().replace(0.0, np.nan)
+        out["trades_z"] = ((df["trades"].astype(float) - t_ma) / t_sd).fillna(0.0).clip(-5.0, 5.0)
+    else:
+        out["trades_z"] = 0.0
+
+    mark = df["mark_close"].astype(float) if "mark_close" in df.columns else close
+    if "index_close" in df.columns:
+        index = df["index_close"].astype(float).replace(0.0, np.nan)
+        basis = ((mark - index) / index).replace([np.inf, -np.inf], 0.0)
+        out["basis"] = basis.fillna(0.0).clip(-0.05, 0.05)
+    else:
+        out["basis"] = 0.0
+    b_ma = out["basis"].rolling(72, min_periods=12).mean()
+    b_sd = out["basis"].rolling(72, min_periods=12).std().replace(0.0, np.nan)
+    out["basis_z"] = ((out["basis"] - b_ma) / b_sd).fillna(0.0).clip(-5.0, 5.0)
+
+    if "open_interest" in df.columns:
+        oi = df["open_interest"].astype(float)
+        out["oi_chg"] = oi.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0).clip(-0.2, 0.2)
+        oi_ma = oi.rolling(72, min_periods=12).mean()
+        oi_sd = oi.rolling(72, min_periods=12).std().replace(0.0, np.nan)
+        out["oi_z"] = ((oi - oi_ma) / oi_sd).fillna(0.0).clip(-5.0, 5.0)
+    else:
+        out["oi_chg"] = 0.0
+        out["oi_z"] = 0.0
+    if "long_short_ratio" in df.columns:
+        out["lsr_dev"] = (df["long_short_ratio"].astype(float) - 1.0).clip(-2.0, 2.0).fillna(0.0)
+    else:
+        out["lsr_dev"] = 0.0
     return out[FEATURE_NAMES].replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
 
@@ -182,3 +252,18 @@ def vol_leverage(vol: pd.Series, target: float = 0.20, max_leverage: float = 2.0
     """反波动杠杆：目标波动 / 实现波动，再夹到 [0, max_leverage]。"""
     lev = target / vol.replace(0.0, np.nan)
     return lev.fillna(1.0).clip(0.0, max_leverage)
+
+
+FEATURE_NAMES = FEATURE_NAMES
+N_FEAT = N_FEAT
+SEQ_LEN = SEQ_LEN
+build_feature_frame = build_feature_frame
+make_windows = make_windows
+last_feature_window = last_feature_window
+execution_aligned_returns = execution_aligned_returns
+vol_leverage = vol_leverage
+FEATURE_NAMES = FEATURE_NAMES
+N_FEAT = N_FEAT
+SEQ_LEN = SEQ_LEN
+last_feature_window = last_feature_window
+build_feature_frame = build_feature_frame

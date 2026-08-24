@@ -1,8 +1,8 @@
-"""PPO Actor-Critic：最近 7 根 K 线 [B, 7, 30] → 仓位 unit ∈ [-1, 1]。
+"""PPO Actor-Critic：最近 7 根 K 线 [B, 7, n_feat] → 仓位 unit ∈ [-1, 1]。
 
 张量约定（PyTorch LSTM batch_first）：
-    [batch, seq=7, feat=30]
-取最后时间步后是 [batch, 64]，不是 [batch, 30, 64]。
+    [batch, seq=7, feat=n_feat]
+取最后时间步后是 [batch, 64]，不是 [batch, n_feat, 64]。
 
 结构：
     LSTM(128) + Dropout(0.2) + LayerNorm
@@ -26,6 +26,8 @@ import torch
 from torch import nn
 from torch.distributions import Normal
 
+from betatrend.nn.dataset import N_FEAT, SEQ_LEN
+
 _EPS = 1e-6
 _STD_MIN = 1e-4
 _STD_MAX = 2.0
@@ -42,12 +44,12 @@ def _dropouts(dropout: float) -> tuple[float, float, float]:
 
 
 class PPOActorCritic(nn.Module):
-    """[B, 7, 30] → 仓位。共享 FC(64) 后分 Actor / Critic。"""
+    """[B, 7, n_feat] → 仓位。共享 FC(64) 后分 Actor / Critic。"""
 
     def __init__(
         self,
-        n_feat: int = 30,
-        seq_len: int = 7,
+        n_feat: int = N_FEAT,
+        seq_len: int = SEQ_LEN,
         dropout: float = 0.2,
     ):
         super().__init__()
@@ -99,7 +101,7 @@ class PPOActorCritic(nn.Module):
         nn.init.zeros_(self.std_head.bias)
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
-        """共享特征 [B, 64]。x 必须是 [B, T=7, F=30]。"""
+        """共享特征 [B, 64]。x 必须是 [B, T=seq_len, F=n_feat]。"""
         if x.ndim != 3:
             raise ValueError(f"expected [B, T, F], got {tuple(x.shape)}")
         h, _ = self.lstm1(x)
@@ -158,3 +160,4 @@ def _tanh_log_prob(dist: Normal, u: torch.Tensor, action: torch.Tensor) -> torch
 
 
 DecisionNet = PPOActorCritic
+PPOActorCritic = PPOActorCritic

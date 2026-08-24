@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "config" / "default.yaml"
+ROOT = ROOT
+DEFAULT_CONFIG = DEFAULT_CONFIG
 
 
 class AccountCfg(BaseModel):

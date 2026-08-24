@@ -1,14 +1,12 @@
-"""OMS 桥：paper 本地成交；签名路径仅 testnet；成交后对账。"""
+"""OMS 桥：paper 本地成交；签名路径默认 testnet；主网下单走 live 闸；成交后对账。"""
 from __future__ import annotations
-
-import os
 
 import pandas as pd
 
 from betatrend.config import Settings
 from betatrend.domain import Fill, OrderIntent
 from betatrend.execution.paper import PaperBroker
-from betatrend.execution.signed import BinanceSignedClient
+from betatrend.execution.signed import BinanceSignedClient, require_mainnet_order_gates
 from betatrend.ledger import Ledger
 from betatrend.logutil import audit
 
@@ -94,19 +92,10 @@ def submit_intents(
         broker = PaperBroker(settings, ledger)
         return broker.execute(intents, prices, ts)
 
-    live_client = client is not None and not getattr(client, "testnet", True)
-    if mode == "live" or live_client:
-        if settings.oms.testnet_only:
-            raise RuntimeError("OMS signed path is testnet-only")
-        if os.environ.get("BETATREND_ALLOW_LIVE") != "1":
-            raise RuntimeError("live trading requires BETATREND_ALLOW_LIVE=1")
-        if confirm != "YES":
-            raise RuntimeError("live trading requires confirm=YES")
-
     if client is None:
         client = BinanceSignedClient(settings)
-    if not getattr(client, "testnet", True) and settings.oms.testnet_only:
-        raise RuntimeError("OMS signed path is testnet-only")
+    if not getattr(client, "testnet", False):
+        require_mainnet_order_gates(settings, confirm)
 
     fills: list[Fill] = []
     for intent in intents:

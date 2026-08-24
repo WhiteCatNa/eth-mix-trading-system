@@ -35,6 +35,12 @@ class DeskCycle:
         _ = capital
         self.strategy.reset()
 
+    def restore_smooth(self, unit: float) -> None:
+        self.strategy.restore_smooth(unit)
+
+    def last_smooth_unit(self) -> float:
+        return self.strategy.last_smooth_unit()
+
     def run(
         self,
         snap: MarketSnapshot,

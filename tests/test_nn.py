@@ -87,9 +87,9 @@ def test_untrained_net_outputs_flat():
     from betatrend.nn.model import DecisionNet
     import torch
 
-    net = DecisionNet(n_feat=30, seq_len=7, dropout=0.0)
+    net = DecisionNet(n_feat=N_FEAT, seq_len=7, dropout=0.0)
     net.eval()
-    x = torch.randn(4, 7, 30)
+    x = torch.randn(4, 7, N_FEAT)
     out = net(x).squeeze(-1)
     torch.testing.assert_close(out, torch.zeros_like(out), atol=1e-5, rtol=0.0)
 
@@ -98,9 +98,9 @@ def test_actor_has_positive_std_head_and_shared_trunk():
     from betatrend.nn.model import PPOActorCritic
     import torch
 
-    net = PPOActorCritic(n_feat=30, seq_len=7, dropout=0.2)
+    net = PPOActorCritic(n_feat=N_FEAT, seq_len=7, dropout=0.2)
     net.eval()
-    x = torch.randn(3, 7, 30)
+    x = torch.randn(3, 7, N_FEAT)
     shared = net._encode(x)
     assert shared.shape == (3, 64)
     mu_raw, std, value = net._heads(shared)
@@ -113,11 +113,12 @@ def test_actor_has_positive_std_head_and_shared_trunk():
     assert any(isinstance(m, torch.nn.ReLU) for m in net.modules())
 
 
-def test_feature_window_is_seven_by_thirty():
+def test_feature_window_is_seven_by_n_feat():
     panel = make_trending_panels(n=80, seed=1, symbols=["ETHUSDT"])["ETHUSDT"]
     feats = build_feature_frame(panel).to_numpy(dtype=np.float32)
     windows = make_windows(feats, seq_len=SEQ_LEN)
-    assert feats.shape[1] == N_FEAT == 30
+    assert feats.shape[1] == N_FEAT
+    assert N_FEAT > 30
     assert windows.shape == (len(panel), SEQ_LEN, N_FEAT)
     last = last_feature_window(panel)
     assert last.shape == (SEQ_LEN, N_FEAT)
@@ -128,7 +129,31 @@ def test_new_regime_features_are_present():
     for name in ("funding_z", "funding_d8", "range_pos", "ret_streak", "trend_persist", "close_z"):
         assert name in FEATURE_NAMES
     assert "tsmom" not in FEATURE_NAMES
-    assert len(FEATURE_NAMES) == 30
+    for name in ("taker_imb", "body", "wick_imb", "gap", "atr_n", "trades_z", "basis", "oi_chg", "lsr_dev"):
+        assert name in FEATURE_NAMES
+    assert len(FEATURE_NAMES) == N_FEAT == 42
+
+
+def test_missing_futures_columns_fill_neutral():
+    panel = make_trending_panels(n=80, seed=1, symbols=["ETHUSDT"])["ETHUSDT"]
+    dropped = panel.drop(columns=[c for c in ("taker_buy_base", "trades", "mark_close", "index_close", "open_interest", "long_short_ratio") if c in panel.columns])
+    feats = build_feature_frame(dropped)
+    assert (feats["taker_imb"] == 0.0).all()
+    assert (feats["trades_z"] == 0.0).all()
+    assert (feats["basis"] == 0.0).all()
+    assert (feats["oi_chg"] == 0.0).all()
+    assert (feats["lsr_dev"] == 0.0).all()
+
+
+def test_extra_features_do_not_look_ahead():
+    panel = make_trending_panels(n=200, seed=2, symbols=["ETHUSDT"])["ETHUSDT"]
+    base = build_feature_frame(panel)
+    mutated = panel.copy()
+    mutated.iloc[120, mutated.columns.get_loc("taker_buy_base")] *= 3.0
+    mutated.iloc[120, mutated.columns.get_loc("open_interest")] *= 1.5
+    after = build_feature_frame(mutated)
+    np.testing.assert_allclose(base.iloc[:120].to_numpy(), after.iloc[:120].to_numpy(), atol=1e-12)
+    assert not np.allclose(base.iloc[120:].to_numpy(), after.iloc[120:].to_numpy())
 
 
 def test_reward_shaping_penalizes_drawdown_more_than_flat():
@@ -154,7 +179,7 @@ def test_replay_buffer_keeps_recent_rollouts():
     buf = ReplayBuffer(n_rollouts=2)
     for i in range(3):
         buf.add(
-            obs=np.ones((4, 7, 30), dtype=np.float32) * i,
+            obs=np.ones((4, 7, N_FEAT), dtype=np.float32) * i,
             actions=np.full(4, float(i), dtype=np.float32),
             logp=np.zeros(4, dtype=np.float32),
             advantages=np.ones(4, dtype=np.float32),
@@ -162,7 +187,7 @@ def test_replay_buffer_keeps_recent_rollouts():
         )
     assert buf.n_stored == 2
     packed = buf.packed()
-    assert packed["obs"].shape == (8, 7, 30)
+    assert packed["obs"].shape == (8, 7, N_FEAT)
     assert packed["actions"].shape == (8,)
     np.testing.assert_allclose(packed["actions"][:4], 1.0)
     np.testing.assert_allclose(packed["actions"][4:], 2.0)

@@ -1,4 +1,4 @@
-"""Walk-forward PPO：观测是最近 7 根 bar 的 [7, 30] 窗口，Actor 输出仓位。
+"""Walk-forward PPO：观测是最近 7 根 bar 的 [7, n_feat] 窗口，Actor 输出仓位。
 
 关键约束：
   - 逐步奖励：执行对齐 PnL → 波动标准化 → 差分夏普 − 回撤惩罚（对齐 Sharpe / 最大回撤）
@@ -30,8 +30,8 @@ from betatrend.nn.dataset import (
     make_windows,
     vol_leverage,
 )
+from betatrend.nn.env import overlay_rewards
 from betatrend.nn.model import PPOActorCritic
-from betatrend.nn.reward import bar_pnl, shape_rewards
 
 HOURLY_BARS_PER_YEAR = 24 * 365
 FEAT_CLIP = 8.0
@@ -98,10 +98,12 @@ def _rollout(
         actions[sl] = a.cpu().numpy()
         logps[sl] = lp.cpu().numpy()
         values[sl] = v.cpu().numpy()
-    pnl = bar_pnl(actions, y, lev, cost)
-    rewards = shape_rewards(
-        pnl,
+    _, rewards = overlay_rewards(
+        actions,
+        y,
+        lev,
         vol_ann,
+        cost,
         eta=float(cfg.reward_ds_eta),
         dd_inc=float(cfg.reward_dd_inc),
         dd_level=float(cfg.reward_dd_level),
@@ -172,11 +174,14 @@ def _train_one(
     inner = max(int(cfg.ppo_inner_epochs), 1)
     epochs = max(int(cfg.nn_epochs), 1)
     replay = ReplayBuffer(n_rollouts=int(cfg.ppo_replay_rollouts))
-    for _ in range(epochs):
+    logger.info("PPO start seed={} n={} epochs={} inner={} replay={}", seed, len(windows), epochs, inner, replay.n_rollouts)
+    for ep in range(epochs):
         actions, logps, values, rewards = _rollout(net, windows, yc, lev, vol_ann, cost, cfg)
         adv, ret = _gae(rewards, values, float(cfg.ppo_gamma), float(cfg.ppo_gae_lambda))
         replay.add(windows, actions, logps, adv, ret)
         _ppo_update(net, opt, replay.packed(), cfg, inner)
+        if ep == 0 or (ep + 1) % 20 == 0 or ep + 1 == epochs:
+            logger.info("PPO seed={} epoch {}/{} mean_r={:.4f}", seed, ep + 1, epochs, float(np.mean(rewards)))
     net.eval()
     return net
 
@@ -218,6 +223,149 @@ def _overlay_metrics(y, pos, lev, cost, steps_per_year) -> dict:
     }
 
 
+def walk_forward_folds(
+    n: int,
+    *,
+    warmup: int,
+    min_train: int,
+    test_h: int,
+    purge: int,
+) -> list[tuple[int, np.ndarray, np.ndarray]]:
+    """Yield (fold_id, train_idx, test_idx). Scaler must be fit on train_idx only."""
+    valid = np.arange(n)
+    valid = valid[(valid >= warmup) & (valid < n - 2)]
+    folds: list[tuple[int, np.ndarray, np.ndarray]] = []
+    fold = 0
+    start = warmup + min_train
+    while start + test_h < n - 2:
+        tr_h = valid[(valid >= warmup) & (valid < start - purge)]
+        te = np.arange(start, min(start + test_h, n - 2))
+        if len(tr_h) < 48 or len(te) < 4:
+            break
+        folds.append((fold, tr_h, te))
+        fold += 1
+        start += test_h
+    return folds
+
+
+def list_fold_jobs(
+    n: int,
+    cfg: StrategyCfg,
+    *,
+    min_train: int | None = None,
+    test_h: int | None = None,
+    purge: int = 24,
+    prod_holdout: int | None = None,
+) -> list[dict]:
+    """Embarrassingly-parallel jobs: one walk-forward fold × seed, plus production seeds."""
+    warmup = max(cfg.min_history, 200)
+    min_train = int(min_train if min_train is not None else 90 * 24)
+    test_h = int(test_h if test_h is not None else 21 * 24)
+    prod_holdout = int(prod_holdout if prod_holdout is not None else 14 * 24)
+    jobs: list[dict] = []
+    for fold, tr, te in walk_forward_folds(n, warmup=warmup, min_train=min_train, test_h=test_h, purge=purge):
+        for s in range(max(int(cfg.nn_seeds), 1)):
+            jobs.append(
+                {
+                    "fold_id": fold,
+                    "seed": 7 + s + fold * 17,
+                    "train_start": int(tr[0]),
+                    "train_end": int(tr[-1] + 1),
+                    "test_start": int(te[0]),
+                    "test_end": int(te[-1] + 1),
+                    "role": "oos",
+                }
+            )
+    valid = np.arange(n)
+    valid = valid[(valid >= warmup) & (valid < n - 2)]
+    tr_h = valid[valid < n - prod_holdout]
+    if len(tr_h) < 48:
+        tr_h = valid
+    for s in range(max(int(cfg.nn_seeds), 1)):
+        jobs.append(
+            {
+                "fold_id": -1,
+                "seed": 101 + s,
+                "train_start": int(tr_h[0]),
+                "train_end": int(tr_h[-1] + 1),
+                "test_start": None,
+                "test_end": None,
+                "role": "prod",
+            }
+        )
+    return jobs
+
+
+def train_fold(
+    panel: pd.DataFrame,
+    settings: Settings,
+    *,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray | None = None,
+    fold_id: int = 0,
+    seed: int = 7,
+    path: Path | None = None,
+) -> dict:
+    """Train one PPO seed on a single fold. Safe to run as an isolated job."""
+    cfg = settings.strategy
+    seq_len = int(cfg.seq_len) if cfg.seq_len else SEQ_LEN
+    cost = cfg.nn_cost_bps / 10_000.0
+    y_clip = 0.04
+    feats = build_feature_frame(panel)
+    y_all = execution_aligned_returns(panel).to_numpy(dtype=np.float64)
+    vol_all = feats["vol_24"].to_numpy(dtype=np.float64)
+    lev_all = vol_leverage(feats["vol_24"], target=cfg.target_vol_annual, max_leverage=cfg.max_leverage).to_numpy(
+        dtype=np.float64
+    )
+    x_all = feats.to_numpy(dtype=np.float64)
+    train_idx = np.asarray(train_idx, dtype=int)
+    median, iqr = _fit_scaler(x_all[train_idx])
+    win = make_windows(_robust_scale(x_all, median, iqr), seq_len=seq_len)
+    net = _train_one(
+        win[train_idx],
+        y_all[train_idx],
+        lev_all[train_idx],
+        vol_all[train_idx],
+        cfg=cfg,
+        cost=cost,
+        seed=int(seed),
+        y_clip=y_clip,
+    )
+    pred_te = None
+    if test_idx is not None and len(test_idx):
+        test_idx = np.asarray(test_idx, dtype=int)
+        pred_te = _predict(net, win[test_idx])
+    out = {
+        "fold_id": int(fold_id),
+        "seed": int(seed),
+        "n_train": int(len(train_idx)),
+        "n_test": int(len(test_idx) if test_idx is not None else 0),
+        "median": median,
+        "iqr": iqr,
+        "pred_te": pred_te,
+    }
+    if path is not None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "kind": "ppo",
+                "seq_len": seq_len,
+                "n_feat": N_FEAT,
+                "feature_names": FEATURE_NAMES,
+                "median": median,
+                "iqr": iqr,
+                "dropout": cfg.nn_dropout,
+                "fold_id": int(fold_id),
+                "seed": int(seed),
+                "states": [{k: v.cpu() for k, v in net.state_dict().items()}],
+            },
+            path,
+        )
+        out["path"] = str(path)
+    return out
+
+
 def train_decision_net(
     panel: pd.DataFrame,
     settings: Settings,
@@ -253,13 +401,29 @@ def train_decision_net(
     prod_holdout = int(prod_holdout if prod_holdout is not None else 14 * 24)
     oos_nn = np.full(len(panel), np.nan)
 
+    folds = walk_forward_folds(
+        len(panel), warmup=warmup, min_train=min_train, test_h=test_h, purge=purge
+    )
+    logger.info(
+        "walk-forward folds={} warmup={} min_train={} test_h={} seeds={} epochs={}",
+        len(folds),
+        warmup,
+        min_train,
+        test_h,
+        max(int(cfg.nn_seeds), 1),
+        max(int(cfg.nn_epochs), 1),
+    )
     fold = 0
-    start = warmup + min_train
-    while start + test_h < len(panel) - 2:
-        tr_h = valid[(valid >= warmup) & (valid < start - purge)]
-        te = np.arange(start, min(start + test_h, len(panel) - 2))
-        if len(tr_h) < 48 or len(te) < 4:
-            break
+    for fold, tr_h, te in folds:
+        logger.info(
+            "fold {}/{} train_idx=[{}, {}) n_train={} n_test={}",
+            fold + 1,
+            len(folds),
+            int(tr_h[0]),
+            int(tr_h[-1] + 1),
+            len(tr_h),
+            len(te),
+        )
         median, iqr = _fit_scaler(x_all[tr_h])
         win = make_windows(_robust_scale(x_all, median, iqr), seq_len=seq_len)
         preds = []
@@ -277,8 +441,7 @@ def train_decision_net(
             preds.append(_predict(net, win[te]))
         pred_te = np.mean(np.stack(preds, axis=0), axis=0).reshape(-1)
         oos_nn[np.asarray(te)] = pred_te
-        fold += 1
-        start += test_h
+    fold = len(folds)
 
     mask = np.isfinite(oos_nn)
     if int(mask.sum()) < 20:
