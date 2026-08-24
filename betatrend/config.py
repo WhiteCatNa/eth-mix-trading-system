@@ -107,17 +107,12 @@ class StrategyCfg(BaseModel):
     decision: str = "rl"
     nn_smooth: float = 0.20
     nn_model_path: str = "models/eth_decision.pt"
-    # trunk 宽度。旧的 LSTM(128,64) 有 86% 参数花在循环栈上，而把 7 根 K 线的顺序
-    # 打乱后输出相关性仍有 0.945 —— 特征本身已经是多尺度时序聚合。
-    nn_hidden: list[int] = Field(default_factory=lambda: [64, 64])
-    nn_arch: str = "mlp"  # "mlp" 或 "lstm"（后者仅供对照）
+    nn_hidden: list[int] = Field(default_factory=lambda: [128, 64])
+    nn_dropout: float = 0.2
     nn_seeds: int = 3
     nn_cost_bps: float = 8.0
     nn_epochs: int = 80
-    # 早停：训练窗尾部切出 nn_valid_frac 做验证，按验证 Sharpe 选最优 epoch 的权重。
     nn_patience: int = 12
-    nn_valid_frac: float = 0.15
-    nn_valid_purge: int = 24
     seq_len: int = 7
     ppo_gamma: float = 0.99
     ppo_gae_lambda: float = 0.95
@@ -131,10 +126,9 @@ class StrategyCfg(BaseModel):
     # 重要性比大多被 clip 饱和，梯度接近零，是纯烧机器。
     ppo_inner_epochs: int = 3
     ppo_replay_rollouts: int = 2
-    # 采样探索让仓位翻动是确定性策略的 12 倍，换手成本从 P&L 量级的 1.1% 涨到 12.4%；
-    # 观测里没有仓位，agent 无法归因这块自伤成本，所以让 sigma 线性收到初始的这个比例。
-    ppo_std_final: float = 0.25
-    nn_ckpt_every: int = 80  # PPO epoch 间隔落盘；0 表示只在整段结束时写
+    grpo_group_size: int = 8  # 每个再平衡状态采样的候选动作数；优势在组内标准化
+    grpo_kl_coef: float = 0.01  # D_KL(π || π_old)，替代 PPO 的 value 约束
+    nn_ckpt_every: int = 80  # GRPO epoch 间隔落盘；0 表示只在整段结束时写
     nn_jobs: int = 1  # 折内并行训练的 seed 进程数；<=0 表示按 nn_seeds 铺满
     nn_threads_per_job: int = 0  # 每个训练进程的 torch 线程数；0 = max(2, 总线程数 / nn_jobs)
     # 奖励 = r - λ·min(r,0)²，r 是波动标准化后的 bar PnL。见 nn/reward.py 的取值依据。

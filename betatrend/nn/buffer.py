@@ -1,15 +1,9 @@
-"""PPO 用的近期 rollout 回放。
+"""GRPO 用的近期 rollout 回放。
 
-PPO 是 on-policy 算法，不能像 DQN 那样随便抽很旧的转移。这里只保留最近
-K 次采样的轨迹，每条带着采集时的 logπ(a|s)。PPO clip 相对“采集策略”
-做重要性比，轻度 off-policy 仍有界。
+GRPO 是 on-policy 算法，只保留最近 K 次采样。每条带着采集时的 logπ(a|s)
+和组内相对优势。clip 相对采集策略做重要性比。
 
-K=1 就是标准 PPO（只用当前 rollout）。K>1 把最近几次轨迹拼起来再打乱
-mini-batch,提高样本利用率，又不把半年前的策略混进来。
-
-观测本体不进 buffer，进来的是它在调用方 obs 数组里的行号。一次训练里
-obs 是固定的 [n, seq_len, n_feat]，K 份副本会让每个 epoch 多拷 K×n×seq_len×n_feat
-个 float，n=1 万量级时是几十 MB 的纯浪费。
+观测本体不进 buffer，进来的是它在调用方 obs 数组里的行号。
 """
 from __future__ import annotations
 
@@ -17,7 +11,7 @@ from collections import deque
 
 import numpy as np
 
-_KEYS = ("index", "actions", "logp", "advantages", "returns")
+_KEYS = ("index", "actions", "logp", "advantages")
 
 
 class ReplayBuffer:
@@ -33,15 +27,13 @@ class ReplayBuffer:
         actions: np.ndarray,
         logp: np.ndarray,
         advantages: np.ndarray,
-        returns: np.ndarray,
     ) -> None:
-        """index 是观测在调用方 obs 数组里的行号；五个数组必须等长。"""
+        """index 是观测在调用方 obs 数组里的行号；四个数组必须等长。"""
         item = {
             "index": np.asarray(index, dtype=np.int64),
             "actions": np.asarray(actions, dtype=np.float32),
             "logp": np.asarray(logp, dtype=np.float32),
             "advantages": np.asarray(advantages, dtype=np.float32),
-            "returns": np.asarray(returns, dtype=np.float32),
         }
         n = len(item["index"])
         bad = sorted(k for k, v in item.items() if len(v) != n)

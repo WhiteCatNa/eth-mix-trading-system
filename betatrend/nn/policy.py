@@ -1,7 +1,7 @@
-"""加载训练好的 PPO 集成，输出 [-1, 1] 上的连续仓位 unit。
+"""加载训练好的 GRPO 集成，输出 [-1, 1] 上的连续仓位 unit。
 
 推理路径：最近 7 根 bar 的 [7, n_feat] 窗口 → median/IQR 稳健标准化 → 各成员
-确定性 Actor 平均 → EMA 平滑 → min_position 死区。权重缺失、kind 不是 ppo、
+确定性 Actor 平均 → EMA 平滑 → min_position 死区。权重缺失、kind 不是 grpo、
 或特征 schema 对不上时不交易（unit=0），不再回退任何规则基准。
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from loguru import logger
 from betatrend.config import ROOT, Settings
 from betatrend.nn.dataset import FEATURE_NAMES, N_FEAT, SEQ_LEN
 from betatrend.nn.env import last_window
-from betatrend.nn.model import PPOActorCritic
+from betatrend.nn.model import GRPOActor
 from betatrend.signals import smooth_unit
 
 FEAT_CLIP = 8.0
@@ -25,7 +25,7 @@ class NeuralPolicy:
         self.settings = settings
         self.cfg = settings.strategy
         self._ready = False
-        self._nets: list[PPOActorCritic] = []
+        self._nets: list[GRPOActor] = []
         self._median: np.ndarray | None = None
         self._iqr: np.ndarray | None = None
         self._seq_len = int(getattr(self.cfg, "seq_len", SEQ_LEN) or SEQ_LEN)
@@ -53,8 +53,8 @@ class NeuralPolicy:
             logger.warning("NN weights missing at {} — staying flat", path)
             return
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        if payload.get("kind") != "ppo":
-            logger.warning("NN checkpoint is not PPO (kind={}) — staying flat", payload.get("kind"))
+        if payload.get("kind") != "grpo":
+            logger.warning("NN checkpoint is not GRPO (kind={}) — staying flat", payload.get("kind"))
             return
         if list(payload.get("feature_names", FEATURE_NAMES)) != list(FEATURE_NAMES):
             logger.warning("NN feature schema mismatch — staying flat")
@@ -64,8 +64,7 @@ class NeuralPolicy:
         if seq_len != SEQ_LEN or n_feat != N_FEAT:
             logger.warning("NN observation shape mismatch ({}, {}) — staying flat", seq_len, n_feat)
             return
-        hidden = [int(v) for v in payload.get("hidden", self.cfg.nn_hidden)]
-        arch = str(payload.get("arch", self.cfg.nn_arch))
+        dropout = float(payload.get("dropout", self.cfg.nn_dropout))
         self._seq_len = seq_len
         self._median = np.asarray(payload["median"], dtype=np.float32)
         self._iqr = np.asarray(payload["iqr"], dtype=np.float32)
@@ -74,8 +73,8 @@ class NeuralPolicy:
             return
         self._nets = []
         for state in payload["states"]:
+            net = GRPOActor(n_feat=n_feat, seq_len=seq_len, dropout=dropout)
             try:
-                net = PPOActorCritic(n_feat=n_feat, seq_len=seq_len, hidden=hidden, arch=arch)
                 net.load_state_dict(state)
             except (RuntimeError, ValueError) as exc:
                 logger.warning("NN weight schema incompatible ({}) — staying flat", exc)
@@ -84,7 +83,7 @@ class NeuralPolicy:
             net.eval()
             self._nets.append(net)
         self._ready = bool(self._nets)
-        logger.info("Loaded {} PPO members from {}", len(self._nets), path)
+        logger.info("Loaded {} GRPO members from {}", len(self._nets), path)
 
     @torch.no_grad()
     def predict_unit(self, panel: pd.DataFrame) -> float:

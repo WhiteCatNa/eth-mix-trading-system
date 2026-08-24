@@ -72,6 +72,27 @@ def cmd_backtest(args) -> int:
     return 0
 
 
+def cmd_explore_nn(args) -> int:
+    """对着 train.log + 最新 fold ckpt 起 TorchExplorer 看板。不碰训练进程。"""
+    settings = _settings(args)
+    setup_logging(settings)
+    from betatrend.nn.explore import run_live
+
+    run_live(
+        log_path=ROOT / args.log if not Path(args.log).is_absolute() else Path(args.log),
+        models_dir=ROOT / args.models_dir if not Path(args.models_dir).is_absolute() else Path(args.models_dir),
+        board_dir=ROOT / args.board_dir if not Path(args.board_dir).is_absolute() else Path(args.board_dir),
+        explorer_dir=(
+            (ROOT / args.board_dir if not Path(args.board_dir).is_absolute() else Path(args.board_dir))
+            / "torchexplorer"
+        ),
+        explorer_port=int(args.port),
+        board_port=int(args.board_port),
+        poll=float(args.poll),
+    )
+    return 0
+
+
 def cmd_train_nn(args) -> int:
     settings = _settings(args)
     setup_logging(settings)
@@ -252,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--decision", choices=["neural", "rl"], default=None)
     b.set_defaults(func=cmd_backtest)
 
-    tn = sub.add_parser("train-nn", help="Walk-forward train the ETH PPO decision net")
+    tn = sub.add_parser("train-nn", help="Walk-forward train the ETH GRPO decision net")
     tn.add_argument("--days", type=int, default=None)
     tn.add_argument("--demo", action="store_true")
     tn.add_argument("--path", type=str, default=None)
@@ -269,6 +290,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="torch threads inside each training process (0=auto split)",
     )
     tn.set_defaults(func=cmd_train_nn)
+
+    ex = sub.add_parser(
+        "explore-nn",
+        help="TorchExplorer board for a running or finished GRPO train-nn",
+    )
+    ex.add_argument(
+        "--log",
+        type=str,
+        default="models/experiments/2026-08-24-grpo-retrain/train.log",
+    )
+    ex.add_argument("--models-dir", type=str, default="models")
+    ex.add_argument(
+        "--board-dir",
+        type=str,
+        default="models/experiments/2026-08-24-grpo-retrain/board",
+    )
+    ex.add_argument("--port", type=int, default=8080, help="TorchExplorer port")
+    ex.add_argument("--board-port", type=int, default=8081, help="metrics board port")
+    ex.add_argument("--poll", type=float, default=5.0)
+    ex.set_defaults(func=cmd_explore_nn)
 
     tf = sub.add_parser("train-fold", help="Train one walk-forward fold × seed (distributed worker)")
     tf.add_argument("--days", type=int, default=None)
