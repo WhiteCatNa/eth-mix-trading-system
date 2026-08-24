@@ -15,6 +15,7 @@ from betatrend.config import ROOT, Settings
 from betatrend.nn.dataset import FEATURE_NAMES, N_FEAT, SEQ_LEN
 from betatrend.nn.env import last_window
 from betatrend.nn.model import PPOActorCritic
+from betatrend.signals import smooth_unit
 
 FEAT_CLIP = 8.0
 
@@ -63,7 +64,8 @@ class NeuralPolicy:
         if seq_len != SEQ_LEN or n_feat != N_FEAT:
             logger.warning("NN observation shape mismatch ({}, {}) — staying flat", seq_len, n_feat)
             return
-        dropout = float(payload.get("dropout", self.cfg.nn_dropout))
+        hidden = [int(v) for v in payload.get("hidden", self.cfg.nn_hidden)]
+        arch = str(payload.get("arch", self.cfg.nn_arch))
         self._seq_len = seq_len
         self._median = np.asarray(payload["median"], dtype=np.float32)
         self._iqr = np.asarray(payload["iqr"], dtype=np.float32)
@@ -72,8 +74,8 @@ class NeuralPolicy:
             return
         self._nets = []
         for state in payload["states"]:
-            net = PPOActorCritic(n_feat=n_feat, seq_len=seq_len, dropout=dropout)
             try:
+                net = PPOActorCritic(n_feat=n_feat, seq_len=seq_len, hidden=hidden, arch=arch)
                 net.load_state_dict(state)
             except (RuntimeError, ValueError) as exc:
                 logger.warning("NN weight schema incompatible ({}) — staying flat", exc)
@@ -93,12 +95,12 @@ class NeuralPolicy:
         x = np.clip(x, -FEAT_CLIP, FEAT_CLIP).astype(np.float32)
         xt = torch.tensor(x[None, ...], dtype=torch.float32)
         nn_unit = float(np.mean([float(net(xt).squeeze().cpu()) for net in self._nets]))
-        unit = nn_unit
-        if self.cfg.long_only:
-            unit = max(unit, 0.0)
-        smooth = float(np.clip(self.cfg.nn_smooth, 0.0, 0.95))
-        unit = (1.0 - smooth) * unit + smooth * self._last_unit
-        if abs(unit) < self.cfg.min_position:
-            unit = 0.0
+        unit = smooth_unit(
+            nn_unit,
+            self._last_unit,
+            smooth=self.cfg.nn_smooth,
+            min_position=self.cfg.min_position,
+            long_only=self.cfg.long_only,
+        )
         self._last_unit = unit
         return float(np.clip(unit, -1.0, 1.0))

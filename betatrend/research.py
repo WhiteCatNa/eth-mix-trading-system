@@ -13,7 +13,7 @@ import pandas as pd
 from loguru import logger
 
 from betatrend.backtest import BacktestResult, Backtester
-from betatrend.config import ROOT, Settings
+from betatrend.config import ROOT, Settings, desk_hold_bars
 from betatrend.domain import MarketSnapshot
 from betatrend.execution.paper import PaperBroker
 from betatrend.ledger import Ledger
@@ -223,7 +223,7 @@ def paper_run(
     symbols = list(panels)
     index = _panel_index(panels)
     warmup = int(settings.backtest.warmup_bars)
-    reb_h = max(int(settings.strategy.rebalance_hours), 8)
+    reb_h = desk_hold_bars(settings.strategy)
     fund_h = int(settings.data.funding_interval_hours)
     state_path = Path(settings.paper.state_file)
     if not state_path.is_absolute():

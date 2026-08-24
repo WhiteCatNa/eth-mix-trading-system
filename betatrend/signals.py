@@ -47,6 +47,32 @@ def apply_open_threshold(unit: float, min_position: float = 0.05) -> float:
     return float(max(-1.0, min(1.0, u)))
 
 
+def smooth_unit(
+    raw_unit: float,
+    last_unit: float,
+    *,
+    smooth: float,
+    min_position: float = 0.05,
+    long_only: bool = False,
+) -> float:
+    """一步 unit 后处理：long_only 截断 → EMA → min_position 归零。
+
+    实盘推理（``NeuralPolicy.predict_unit``）和训练评估（``nn.train.desk_positions``）
+    共用这一份，两边的口径就不会再各走各的。
+
+    返回的是新的 EMA 状态，**没有** clip 到 [-1, 1]：被 min_position 归零时状态
+    一起归零，这是原实现的行为。调用方拿去当仓位用时自己 clip。
+    """
+    u = float(raw_unit)
+    if long_only:
+        u = max(u, 0.0)
+    a = min(max(float(smooth), 0.0), 0.95)
+    u = (1.0 - a) * u + a * float(last_unit)
+    if abs(u) < max(float(min_position), 0.0):
+        return 0.0
+    return u
+
+
 def side_from_unit(unit: float) -> PositionSide:
     if unit > 0.0:
         return PositionSide.LONG

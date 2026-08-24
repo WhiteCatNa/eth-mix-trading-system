@@ -59,9 +59,10 @@
     "lsr_dev"
   ],
   "reward": {
-    "eta": 0.013888888888888888,
-    "dd_inc": 1.0,
-    "dd_level": 0.05,
+    "form": "r - down_lambda * min(r, 0)^2 - dd_inc * deepen - dd_level * depth",
+    "down_lambda": 0.5,
+    "dd_inc": 0.0,
+    "dd_level": 0.0,
     "clip": 5.0
   },
   "backtest_exec": {

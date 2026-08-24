@@ -20,3 +20,4 @@ build/
 models/*.pt
 models/*_oos.parquet
 models/*.json
+models/experiments/

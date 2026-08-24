@@ -8,6 +8,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from betatrend.mathx import BARS_PER_YEAR
+
 # 含义简述：
 #   ret_*       多周期简单收益（1h / 4h / 12h / 1d / 3d / 7d）
 #   vol_*       实现波动（已年化）
@@ -252,6 +254,22 @@ def vol_leverage(vol: pd.Series, target: float = 0.20, max_leverage: float = 2.0
     """反波动杠杆：目标波动 / 实现波动，再夹到 [0, max_leverage]。"""
     lev = target / vol.replace(0.0, np.nan)
     return lev.fillna(1.0).clip(0.0, max_leverage)
+
+
+def sizing_vol(panel: pd.DataFrame, lookback: int) -> pd.Series:
+    """给杠杆用的年化波动，口径与 desk 的 ``mathx.realized_vol`` 完全一致。
+
+    特征表里的 ``vol_24`` 是模型输入，窗口写死 24；desk 定仓位用的是
+    ``strategy.vol_lookback``（默认 72）。两者不是一回事，训练/评估的杠杆
+    必须跟 desk 走，否则 OOS 的仓位曲线实盘根本不会出现。
+
+    对齐点：同为 ddof=1 样本标准差、同样按 √8760 年化、样本不足时同样退到
+    0.20 占位（``realized_vol`` 的行为），因此 ``vol_leverage`` 会给出 lev=1.0。
+    """
+    lookback = max(int(lookback), 2)
+    ret = panel["close"].astype(float).pct_change().fillna(0.0)
+    vol = ret.rolling(lookback, min_periods=lookback).std() * np.sqrt(BARS_PER_YEAR)
+    return vol.fillna(0.20).clip(lower=1e-6)
 
 
 FEATURE_NAMES = FEATURE_NAMES

@@ -19,7 +19,7 @@ binance:
 data:
   cache_dir: data/cache
   kline_interval: 1h
-  lookback_days: 500
+  lookback_days: 2430   # 约 2020-01-01 → 现在，ETHUSDT 永续上市后的完整 1h
   funding_interval_hours: 8
 
 fees:
@@ -47,12 +47,14 @@ strategy:
   decision: rl
   nn_smooth: 0.20
   nn_model_path: models/eth_decision.pt
-  nn_hidden: [128, 64]
-  nn_dropout: 0.2   # >0 启用 LSTM0.2 / FC0.3 / 分支0.2；输出头不加 dropout
+  nn_hidden: [64, 64]     # trunk 宽度
+  nn_arch: mlp            # mlp | lstm（lstm 仅供对照，参数量约 6 倍）
   nn_seeds: 3
   nn_cost_bps: 8.0
   nn_epochs: 80
-  nn_patience: 12
+  nn_patience: 12         # 验证 Sharpe 连续这么多 epoch 没提升就停，并回滚到最优权重
+  nn_valid_frac: 0.15     # 训练窗尾部切出来做验证的比例
+  nn_valid_purge: 24      # train 与 valid 之间的隔离带（根）
   seq_len: 7
   ppo_gamma: 0.99
   ppo_gae_lambda: 0.95
@@ -62,14 +64,17 @@ strategy:
   ppo_lr: 0.0003
   ppo_batch: 256
   ppo_max_grad_norm: 0.5
-  ppo_inner_epochs: 4
-  ppo_replay_rollouts: 4
+  ppo_inner_epochs: 3     # inner × replay = 每个样本的反传次数，标准 PPO 在 3~10
+  ppo_replay_rollouts: 2
+  ppo_std_final: 0.25     # 探索 sigma 线性收到初始的这个比例，抑制自伤换手成本
   nn_ckpt_every: 80       # 每 80 个 epoch 落一份，折内也会写
-  reward_ds_eta: 0.0139   # ≈ 1/72，差分夏普/索提诺的滑动窗约 3 天
-  reward_dd_inc: 1.0      # 回撤加深惩罚
-  reward_dd_level: 0.05   # 停留在回撤里的持续惩罚
-  reward_clip: 5.0
-  reward_so_w: 1.0        # 差分 Sortino 权重，与差分 Sharpe 相加
+  nn_jobs: 3              # 折内 seed 并行进程数；<=0 按 nn_seeds 铺满，1 为串行
+  nn_threads_per_job: 0   # 每进程 torch 线程数；0 = max(2, torch 线程数 / nn_jobs)
+  # 奖励 = r - λ·min(r,0)²，r = 波动标准化后的 bar PnL
+  reward_down_lambda: 0.5 # 下行方差权重；0.25~1.0 是平坦最优，见 nn/reward.py
+  reward_dd_inc: 0.0      # 路径回撤加深惩罚，默认关（下行方差已覆盖）
+  reward_dd_level: 0.0    # 停留在回撤里的持续惩罚，默认关
+  reward_clip: 5.0        # 纯护栏，正常量级不触发
 
 backtest:
   warmup_bars: 400
