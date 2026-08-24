@@ -47,26 +47,22 @@ strategy:
   decision: rl
   nn_smooth: 0.20
   nn_model_path: models/eth_decision.pt
-  nn_hidden: [64, 64]     # trunk 宽度
-  nn_arch: mlp            # mlp | lstm（lstm 仅供对照，参数量约 6 倍）
+  nn_hidden: [128, 64]
+  nn_dropout: 0.2   # >0 启用 LSTM0.2 / FC0.3 / 分支0.2；输出头不加 dropout
   nn_seeds: 3
   nn_cost_bps: 8.0
   nn_epochs: 80
-  nn_patience: 12         # 验证 Sharpe 连续这么多 epoch 没提升就停，并回滚到最优权重
-  nn_valid_frac: 0.15     # 训练窗尾部切出来做验证的比例
-  nn_valid_purge: 24      # train 与 valid 之间的隔离带（根）
+  nn_patience: 12
   seq_len: 7
-  ppo_gamma: 0.99
-  ppo_gae_lambda: 0.95
   ppo_clip: 0.2
   ppo_ent_coef: 0.01
-  ppo_vf_coef: 0.5
   ppo_lr: 0.0003
   ppo_batch: 256
   ppo_max_grad_norm: 0.5
-  ppo_inner_epochs: 3     # inner × replay = 每个样本的反传次数，标准 PPO 在 3~10
+  ppo_inner_epochs: 3     # inner × replay = 每个样本的反传次数
   ppo_replay_rollouts: 2
-  ppo_std_final: 0.25     # 探索 sigma 线性收到初始的这个比例，抑制自伤换手成本
+  grpo_group_size: 8      # 每个再平衡点采 G 个动作，组内相对优势
+  grpo_kl_coef: 0.01      # KL(π || π_old)
   nn_ckpt_every: 80       # 每 80 个 epoch 落一份，折内也会写
   nn_jobs: 3              # 折内 seed 并行进程数；<=0 按 nn_seeds 铺满，1 为串行
   nn_threads_per_job: 0   # 每进程 torch 线程数；0 = max(2, torch 线程数 / nn_jobs)

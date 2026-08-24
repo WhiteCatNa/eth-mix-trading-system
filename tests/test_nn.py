@@ -87,63 +87,46 @@ def test_untrained_net_outputs_flat():
     from betatrend.nn.model import DecisionNet
     import torch
 
-    net = DecisionNet(n_feat=N_FEAT, seq_len=7)
+    net = DecisionNet(n_feat=N_FEAT, seq_len=7, dropout=0.0)
     net.eval()
     x = torch.randn(4, 7, N_FEAT)
     out = net(x).squeeze(-1)
     torch.testing.assert_close(out, torch.zeros_like(out), atol=1e-5, rtol=0.0)
 
 
-def test_actor_has_positive_std_head_and_shared_trunk():
-    from betatrend.nn.model import PPOActorCritic
+def test_nan_mean_head_does_not_crash_normal():
+    from betatrend.nn.model import GRPOActor
     import torch
 
-    net = PPOActorCritic(n_feat=N_FEAT, seq_len=7, hidden=(64, 64), arch="mlp")
+    net = GRPOActor(n_feat=N_FEAT, seq_len=7, dropout=0.0)
+    net.eval()
+    with torch.no_grad():
+        net.mean_head.weight.fill_(float("nan"))
+        dist = net._dist(torch.zeros(4, 7, N_FEAT))
+    assert torch.isfinite(dist.mean).all()
+    assert torch.isfinite(dist.stddev).all()
+
+
+def test_actor_has_positive_std_head_and_shared_trunk():
+    from betatrend.nn.model import GRPOActor
+    import torch
+
+    net = GRPOActor(n_feat=N_FEAT, seq_len=7, dropout=0.2)
     net.eval()
     x = torch.randn(3, 7, N_FEAT)
     shared = net._encode(x)
     assert shared.shape == (3, 64)
-    mu_raw, std, value = net._heads(shared)
-    assert mu_raw.shape == std.shape == value.shape == (3,)
+    mu_raw, std = net._heads(shared)
+    assert mu_raw.shape == std.shape == (3,)
     assert torch.all(std > 0)
-    action, logp, v, ent = net.act(x, deterministic=True)
+    action, logp, ent = net.act(x, deterministic=True)
     torch.testing.assert_close(action, torch.tanh(mu_raw), atol=1e-5, rtol=0.0)
-    assert logp.shape == v.shape == ent.shape == (3,)
+    assert logp.shape == ent.shape == (3,)
+    grp_a, grp_lp = net.sample_group(x[:1], 4)
+    assert grp_a.shape == grp_lp.shape == (4, 1)
+    assert not any(n.startswith("value") or n.startswith("critic") for n, _ in net.named_parameters())
     assert any(isinstance(m, torch.nn.LayerNorm) for m in net.modules())
     assert any(isinstance(m, torch.nn.ReLU) for m in net.modules())
-    assert not any(isinstance(m, torch.nn.Dropout) for m in net.modules())
-
-
-def test_mlp_is_smaller_than_lstm_and_logprob_is_mode_invariant():
-    from betatrend.nn.model import PPOActorCritic
-    import torch
-
-    mlp = PPOActorCritic(n_feat=N_FEAT, seq_len=7, hidden=(64, 64), arch="mlp")
-    lstm = PPOActorCritic(n_feat=N_FEAT, seq_len=7, hidden=(128, 64), arch="lstm")
-    n_mlp = sum(p.numel() for p in mlp.parameters())
-    n_lstm = sum(p.numel() for p in lstm.parameters())
-    assert n_mlp < n_lstm / 3
-    x = torch.randn(32, 7, N_FEAT)
-    mlp.eval()
-    with torch.no_grad():
-        a, lp_eval, _, _ = mlp.act(x, deterministic=False, std_scale=0.4)
-    mlp.train()
-    with torch.no_grad():
-        lp_train, _, _ = mlp.evaluate(x, a, std_scale=0.4)
-    ratio = (lp_train - lp_eval).exp()
-    torch.testing.assert_close(ratio, torch.ones_like(ratio), atol=1e-5, rtol=0.0)
-
-
-def test_split_valid_keeps_a_purge_gap():
-    from betatrend.nn.train import _split_valid
-
-    idx = np.arange(2000)
-    fit, val = _split_valid(idx, frac=0.15, purge=24)
-    assert val is not None
-    assert fit[-1] + 1 + 24 <= val[0]
-    tiny, none = _split_valid(np.arange(300), frac=0.15, purge=24)
-    assert none is None
-    assert len(tiny) == 300
 
 
 def test_feature_window_is_seven_by_n_feat():
@@ -284,6 +267,51 @@ def test_reward_ranks_signals_by_realised_sharpe():
     assert reward["oracle"] > reward["flat"] > reward["anti"]
 
 
+def test_desk_hold_stops_intra_hold_turnover_from_entering_pnl():
+    """训练奖励必须按 8h 冻结记账，否则逐小时翻仓的探索噪声会主导梯度。"""
+    from betatrend.config import StrategyCfg, desk_hold_bars
+    from betatrend.nn.reward import bar_pnl
+    from betatrend.nn.train import desk_positions
+
+    n = 64
+    flip = np.where(np.arange(n) % 2 == 0, 0.8, -0.8)
+    hold = desk_hold_bars(StrategyCfg())
+    held = desk_positions(flip, smooth=0.0, min_position=0.0, hold=hold)
+    for start in range(0, n, hold):
+        sl = held[start : start + hold]
+        assert np.allclose(sl, sl[0])
+    y = np.zeros(n)
+    lev = np.ones(n)
+    raw_cost = float(np.abs(bar_pnl(flip, y, lev, 0.001)).sum())
+    held_cost = float(np.abs(bar_pnl(held, y, lev, 0.001)).sum())
+    assert raw_cost > held_cost * 4
+
+
+def test_hold_group_rewards_and_advantages():
+    from betatrend.nn.reward import group_advantages, hold_group_rewards
+
+    y = np.array([0.01, 0.01, 0.01, 0.01])
+    lev = np.ones(4)
+    vol = np.full(4, 0.20)
+    r, held, ema = hold_group_rewards(
+        np.array([1.0, 0.0, -1.0]),
+        last_unit=0.0,
+        prev_exp=0.0,
+        y=y,
+        lev=lev,
+        vol_ann=vol,
+        cost=0.0,
+        smooth=0.0,
+        min_position=0.0,
+    )
+    assert held.tolist() == [1.0, 0.0, -1.0]
+    assert r[0] > r[1] > r[2]
+    adv = group_advantages(r)
+    assert adv.shape == (3,)
+    assert abs(float(adv.mean())) < 1e-6
+    np.testing.assert_allclose(group_advantages(np.ones(5)), 0.0)
+
+
 def test_replay_buffer_keeps_recent_rollouts():
     from betatrend.nn.buffer import ReplayBuffer
 
@@ -294,7 +322,6 @@ def test_replay_buffer_keeps_recent_rollouts():
             actions=np.full(4, float(i), dtype=np.float32),
             logp=np.zeros(4, dtype=np.float32),
             advantages=np.ones(4, dtype=np.float32),
-            returns=np.ones(4, dtype=np.float32),
         )
     assert buf.n_stored == 2
     assert len(buf) == 8
@@ -316,7 +343,6 @@ def test_replay_buffer_rejects_ragged_rollout():
             actions=np.zeros(3, dtype=np.float32),
             logp=np.zeros(4, dtype=np.float32),
             advantages=np.zeros(4, dtype=np.float32),
-            returns=np.zeros(4, dtype=np.float32),
         )
 
 
@@ -459,9 +485,9 @@ def test_oos_report_carries_both_contracts(settings, tmp_path):
     assert contract["hold_bars"] == 8
     assert contract["vol_lookback"] == settings.strategy.vol_lookback
     assert contract["nn_smooth"] == pytest.approx(settings.strategy.nn_smooth)
-    # 评估用实盘费率（maker 2bps + 滑点 1.5bps），不是训练那个 8bps
+    # 训练 overlay 与 desk 评估同一套费率（maker 2bps + 滑点 1.5bps）
     assert contract["eval_cost_bps"] == pytest.approx(3.5)
-    assert contract["train_cost_bps"] == pytest.approx(settings.strategy.nn_cost_bps)
+    assert contract["train_cost_bps"] == pytest.approx(3.5)
     # 主指标取 desk 口径
     assert m["eval_primary"]["sharpe"] == pytest.approx(m["oos_neural"]["sharpe"])
     # 冻结 8 根 bar 之后换手必然低于逐 bar 信号
@@ -513,7 +539,7 @@ def test_dump_ckpt_is_atomic_and_loadable(tmp_path):
     assert path.exists()
     assert not path.with_name("mid.pt.tmp").exists()
     blob = torch.load(path, map_location="cpu", weights_only=False)
-    assert blob["kind"] == "ppo"
+    assert blob["kind"] == "grpo"
     assert blob["step"] == 500
     assert blob["partial"] is True
     assert blob["n_feat"] == N_FEAT

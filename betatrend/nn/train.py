@@ -1,9 +1,10 @@
-"""Walk-forward PPO：观测是最近 7 根 bar 的 [7, n_feat] 窗口，Actor 输出仓位。
+"""Walk-forward GRPO：观测是最近 7 根 bar 的 [7, n_feat] 窗口，Actor 输出仓位。
 
 关键约束：
-  - 逐步奖励：执行对齐 PnL → 波动标准化 → 差分夏普 − 回撤惩罚（对齐 Sharpe / 最大回撤）
+  - 逐步奖励：desk 执行后的窗口 PnL（8h 冻结 + 实盘费率）→ 波动标准化 → r − λ·min(r,0)²
+  - 同一再平衡状态下采 G 个动作，组内 (r-mean)/std 当优势，没有 Critic / GAE
   - 每折只在训练集上拟合 scaler，测试折绝不回头挑参
-  - 损失 = clipped surrogate + value + entropy，没有 TSMOM 残差项
+  - 损失 = clipped surrogate + KL(π || π_old) − entropy，没有 TSMOM 残差项
   - 全样本权重只在 walk-forward 报告过关后用于推理，OOS 数字才是诚实成绩
   - 折与折之间按 seed 链条热启动：网络权重接着用，scaler / 优化器每折重来
   - 同一折的各 seed 之间没有依赖，nn_jobs>1 时用 spawn 进程池并行；折与折仍严格串行
@@ -36,8 +37,8 @@ from betatrend.nn.dataset import (
     sizing_vol,
     vol_leverage,
 )
-from betatrend.nn.env import overlay_rewards
-from betatrend.nn.model import PPOActorCritic
+from betatrend.nn.model import GRPOActor
+from betatrend.nn.reward import group_advantages, hold_group_rewards
 from betatrend.signals import smooth_unit
 
 HOURLY_BARS_PER_YEAR = 24 * 365
@@ -78,100 +79,93 @@ def _fit_scaler(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return median.astype(np.float32), iqr.astype(np.float32)
 
 
-def _split_valid(
-    train_idx: np.ndarray, *, frac: float, purge: int, min_valid: int = 200, min_fit: int = 480
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """训练窗尾部切出验证段，中间留 purge 根隔离带。
-
-    切不出足够长度就整段拿去训练并返回 None —— 早停失效好过在几十根 K 线上选权重。
-    """
-    train_idx = np.asarray(train_idx, dtype=int)
-    n = len(train_idx)
-    n_val = int(round(n * float(frac)))
-    if frac <= 0.0 or n_val < min_valid:
-        return train_idx, None
-    cut = n - n_val - max(int(purge), 0)
-    if cut < min_fit:
-        return train_idx, None
-    return train_idx[:cut], train_idx[n - n_val :]
-
-
-def _gae(rewards: np.ndarray, values: np.ndarray, gamma: float, lam: float) -> tuple[np.ndarray, np.ndarray]:
-    t_len = len(rewards)
-    adv = np.zeros(t_len, dtype=np.float64)
-    last = 0.0
-    next_v = 0.0
-    for t in range(t_len - 1, -1, -1):
-        done = 1.0 if t == t_len - 1 else 0.0
-        delta = rewards[t] + gamma * next_v * (1.0 - done) - values[t]
-        last = delta + gamma * lam * (1.0 - done) * last
-        adv[t] = last
-        next_v = values[t]
-    ret = adv + values
-    return adv.astype(np.float32), ret.astype(np.float32)
-
-
 @torch.no_grad()
-def _rollout(
-    net: PPOActorCritic,
+def _grpo_rollout(
+    net: GRPOActor,
     obs: torch.Tensor,
     y: np.ndarray,
     lev: np.ndarray,
     vol_ann: np.ndarray,
     cost: float,
     cfg: StrategyCfg,
-    std_scale: float = 1.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """在每个再平衡点采 G 个动作，用窗口总奖励做组内相对优势。
+
+    观测不含仓位，所以所有再平衡点可以先一批采样；奖励仍按成交路径顺序算，
+    因为换手取决于上一窗口结束时的暴露。返回的 index 指向再平衡 bar。
+    第 0 号组成员真正成交，用来推进 EMA / 暴露。
+    """
     net.eval()
-    t_len = int(obs.shape[0])
-    actions = np.zeros(t_len, dtype=np.float32)
-    logps = np.zeros(t_len, dtype=np.float32)
-    values = np.zeros(t_len, dtype=np.float32)
-    for i in range(0, t_len, ROLLOUT_BS):
-        sl = slice(i, min(i + ROLLOUT_BS, t_len))
-        a, lp, v, _ = net.act(obs[sl], deterministic=False, std_scale=std_scale)
-        actions[sl] = a.cpu().numpy()
-        logps[sl] = lp.cpu().numpy()
-        values[sl] = v.cpu().numpy()
-    _, rewards = overlay_rewards(
-        actions,
-        y,
-        lev,
-        vol_ann,
-        cost,
+    n = int(obs.shape[0])
+    hold = desk_hold_bars(cfg)
+    group = max(int(cfg.grpo_group_size), 2)
+    reb = np.arange(0, n, hold, dtype=np.int64)
+    action_g, logp_g = net.sample_group(obs.index_select(0, torch.from_numpy(reb)), group)
+    action_g = action_g.cpu().numpy()
+    logp_g = logp_g.cpu().numpy()
+    last_unit = 0.0
+    prev_exp = 0.0
+    idx_out: list[np.ndarray] = []
+    act_out: list[np.ndarray] = []
+    lp_out: list[np.ndarray] = []
+    adv_out: list[np.ndarray] = []
+    exec_r: list[float] = []
+    kw = dict(
+        cost=float(cost),
+        smooth=float(cfg.nn_smooth),
+        min_position=float(cfg.min_position),
+        long_only=bool(cfg.long_only),
         down_lambda=float(cfg.reward_down_lambda),
         dd_inc=float(cfg.reward_dd_inc),
         dd_level=float(cfg.reward_dd_level),
         clip=float(cfg.reward_clip),
     )
-    return actions, logps, values, rewards
+    for i, t in enumerate(reb):
+        sl = slice(int(t), min(int(t) + hold, n))
+        rewards, held, ema = hold_group_rewards(
+            action_g[:, i],
+            last_unit=last_unit,
+            prev_exp=prev_exp,
+            y=y[sl],
+            lev=lev[sl],
+            vol_ann=vol_ann[sl],
+            **kw,
+        )
+        adv = np.nan_to_num(group_advantages(rewards), nan=0.0, posinf=0.0, neginf=0.0)
+        idx_out.append(np.full(group, int(t), dtype=np.int64))
+        act_out.append(np.asarray(action_g[:, i], dtype=np.float32))
+        lp_out.append(np.asarray(logp_g[:, i], dtype=np.float32))
+        adv_out.append(adv)
+        last_unit = float(ema[0])
+        prev_exp = float(held[0] * lev[sl][-1])
+        exec_r.append(float(rewards[0]))
+    return (
+        np.concatenate(idx_out),
+        np.concatenate(act_out),
+        np.concatenate(lp_out),
+        np.concatenate(adv_out),
+        float(np.mean(exec_r)) if exec_r else 0.0,
+    )
 
 
-def _ppo_update(
-    net: PPOActorCritic,
+def _grpo_update(
+    net: GRPOActor,
     opt: torch.optim.Optimizer,
     obs: torch.Tensor,
     packed: dict[str, np.ndarray],
     cfg: StrategyCfg,
     inner_epochs: int,
-    std_scale: float = 1.0,
 ) -> None:
-    """obs 是整段观测 [n, seq_len, n_feat]；packed["index"] 指回它的行。
-
-    ``std_scale`` 用当前 epoch 的值：重放的旧 rollout 是在更大的 sigma 下采的，
-    比率 π_new/π_old 把这段差异算进去正是重要性采样该做的事。
-    """
+    """obs 是整段观测；packed["index"] 指回再平衡 bar。优势已经是组内相对值，不再全局标准化。"""
     net.train()
-    advantages = packed["advantages"]
-    t_len = len(advantages)
+    t_len = len(packed["advantages"])
     batch = min(max(int(cfg.ppo_batch), 16), max(t_len, 1))
     clip = float(cfg.ppo_clip)
-    adv_full = ((advantages - advantages.mean()) / (float(advantages.std()) + 1e-8)).astype(np.float32)
+    kl_coef = float(cfg.grpo_kl_coef)
     rows = torch.from_numpy(packed["index"])
     act_all = torch.from_numpy(packed["actions"])
     logp_all = torch.from_numpy(packed["logp"])
-    ret_all = torch.from_numpy(packed["returns"])
-    adv_all = torch.from_numpy(adv_full)
+    adv_all = torch.from_numpy(packed["advantages"])
     idx = np.arange(t_len)
     for _ in range(inner_epochs):
         np.random.shuffle(idx)
@@ -183,54 +177,24 @@ def _ppo_update(
             act = act_all.index_select(0, mb)
             oldlp = logp_all.index_select(0, mb)
             adv = adv_all.index_select(0, mb)
-            ret = ret_all.index_select(0, mb)
-            logp, value, ent = net.evaluate(xt, act, std_scale=std_scale)
-            ratio = (logp - oldlp).exp()
+            logp, ent = net.evaluate(xt, act)
+            log_ratio = (logp - oldlp).clamp(-10.0, 10.0)
+            ratio = log_ratio.exp()
             surr1 = ratio * adv
             surr2 = ratio.clamp(1.0 - clip, 1.0 + clip) * adv
             pg = -torch.min(surr1, surr2).mean()
-            vf = (value - ret).pow(2).mean()
-            loss = pg + float(cfg.ppo_vf_coef) * vf - float(cfg.ppo_ent_coef) * ent.mean()
+            # DeepSeek GRPO：β (π_old/π_new − log(π_old/π_new) − 1)
+            kl = ((-log_ratio).exp() + log_ratio - 1.0).mean()
+            loss = pg + kl_coef * kl - float(cfg.ppo_ent_coef) * ent.mean()
+            if not torch.isfinite(loss):
+                continue
             opt.zero_grad()
             loss.backward()
+            for p in net.parameters():
+                if p.grad is not None:
+                    p.grad.nan_to_num_(0.0)
             nn.utils.clip_grad_norm_(net.parameters(), float(cfg.ppo_max_grad_norm))
             opt.step()
-
-
-@torch.no_grad()
-def _deterministic_unit(net: PPOActorCritic, obs: torch.Tensor) -> np.ndarray:
-    """贪心仓位，按 rollout 的分块走，不改动 net 的 train/eval 状态。"""
-    was_training = net.training
-    net.eval()
-    t_len = int(obs.shape[0])
-    out = np.zeros(t_len, dtype=np.float32)
-    for i in range(0, t_len, ROLLOUT_BS):
-        sl = slice(i, min(i + ROLLOUT_BS, t_len))
-        out[sl] = net(obs[sl]).squeeze(-1).cpu().numpy()
-    if was_training:
-        net.train()
-    return out
-
-
-def _valid_score(
-    net: PPOActorCritic,
-    obs_va: torch.Tensor,
-    y_va: np.ndarray,
-    lev_va: np.ndarray,
-    cost: float,
-) -> float:
-    """验证集上确定性策略的 Sharpe（未年化）。
-
-    早停盯的是部署时真正跑的贪心策略，而不是 rollout 的采样奖励 —— 后者被探索换手
-    污染，训练日志里的 mean_r 与上线表现能差一倍。
-    """
-    unit = _deterministic_unit(net, obs_va).astype(np.float64)
-    exp = unit * lev_va
-    net_ret = exp * y_va - cost * np.abs(np.diff(exp, prepend=exp[:1]))
-    sd = float(np.std(net_ret))
-    if not np.isfinite(sd) or sd < 1e-12:
-        return float("-inf")
-    return float(np.mean(net_ret) / sd)
 
 
 def _dump_ckpt(path: Path, payload: dict) -> Path:
@@ -254,14 +218,13 @@ def _ckpt_payload(
     extra: dict | None = None,
 ) -> dict:
     blob = {
-        "kind": "ppo",
+        "kind": "grpo",
         "seq_len": int(seq_len),
         "n_feat": N_FEAT,
         "feature_names": FEATURE_NAMES,
         "median": median,
         "iqr": iqr,
-        "hidden": [int(v) for v in cfg.nn_hidden],
-        "arch": str(cfg.nn_arch),
+        "dropout": cfg.nn_dropout,
         "states": states,
     }
     if extra:
@@ -282,14 +245,11 @@ def _train_one(
     ckpt_prefix: Path | None = None,
     ckpt_meta: dict | None = None,
     init_state: dict | None = None,
-    valid: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
-) -> PPOActorCritic:
+) -> GRPOActor:
     torch.manual_seed(seed)
     np.random.seed(seed)
     seq_len = int(cfg.seq_len) if cfg.seq_len else SEQ_LEN
-    net = PPOActorCritic(
-        n_feat=N_FEAT, seq_len=seq_len, hidden=cfg.nn_hidden, arch=cfg.nn_arch
-    )
+    net = GRPOActor(n_feat=N_FEAT, seq_len=seq_len, dropout=cfg.nn_dropout)
     if init_state is not None:
         net.load_state_dict(init_state)
     opt = torch.optim.AdamW(net.parameters(), lr=float(cfg.ppo_lr), weight_decay=1e-4)
@@ -300,65 +260,23 @@ def _train_one(
     ckpt_every = int(getattr(cfg, "nn_ckpt_every", 0) or 0)
     # 观测在整段训练里不变：转一次张量，之后 rollout 切片和 minibatch 都只做 index_select
     obs = torch.from_numpy(np.ascontiguousarray(windows, dtype=np.float32))
-    rows = np.arange(len(windows), dtype=np.int64)
-
-    obs_va = y_va = lev_va = None
-    if valid is not None:
-        win_va, y_va, lev_va = valid
-        obs_va = torch.from_numpy(np.ascontiguousarray(win_va, dtype=np.float32))
-        y_va = np.clip(y_va, -y_clip, y_clip)
-    patience = max(int(cfg.nn_patience), 0)
-    std_final = float(cfg.ppo_std_final)
-    best_score = float("-inf")
-    best_state: dict | None = None
-    best_epoch = 0
-    stale = 0
-
     logger.info(
-        "PPO start seed={} n={} n_valid={} epochs={} inner={} replay={} warm_start={}",
+        "GRPO start seed={} n={} epochs={} group={} inner={} replay={} warm_start={}",
         seed,
         len(windows),
-        0 if obs_va is None else int(obs_va.shape[0]),
         epochs,
+        max(int(cfg.grpo_group_size), 2),
         inner,
         replay.n_rollouts,
         init_state is not None,
     )
     for ep in range(epochs):
-        std_scale = 1.0 + (std_final - 1.0) * (ep / max(epochs - 1, 1))
-        actions, logps, values, rewards = _rollout(net, obs, yc, lev, vol_ann, cost, cfg, std_scale)
-        adv, ret = _gae(rewards, values, float(cfg.ppo_gamma), float(cfg.ppo_gae_lambda))
-        replay.add(rows, actions, logps, adv, ret)
-        _ppo_update(net, opt, obs, replay.packed(), cfg, inner, std_scale)
+        rows, actions, logps, adv, mean_r = _grpo_rollout(net, obs, yc, lev, vol_ann, cost, cfg)
+        replay.add(rows, actions, logps, adv)
+        _grpo_update(net, opt, obs, replay.packed(), cfg, inner)
         step = ep + 1
-
-        score = None
-        if obs_va is not None:
-            score = _valid_score(net, obs_va, y_va, lev_va, cost)
-            if score > best_score:
-                best_score, best_epoch, stale = score, step, 0
-                best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
-            else:
-                stale += 1
         if ep == 0 or step % 20 == 0 or step == epochs:
-            logger.info(
-                "PPO seed={} epoch {}/{} mean_r={:.4f} sigma×{:.2f} valid_sharpe={}",
-                seed,
-                step,
-                epochs,
-                float(np.mean(rewards)),
-                std_scale,
-                "n/a" if score is None else f"{score:.4f}",
-            )
-        if patience and stale >= patience:
-            logger.info(
-                "PPO seed={} early stop at epoch {} (best {} @ epoch {})",
-                seed,
-                step,
-                f"{best_score:.4f}",
-                best_epoch,
-            )
-            break
+            logger.info("GRPO seed={} epoch {}/{} mean_r={:.4f}", seed, step, epochs, mean_r)
         if ckpt_prefix is not None and ckpt_every > 0 and step % ckpt_every == 0:
             meta = dict(ckpt_meta or {})
             median = meta.pop("median", None)
@@ -385,15 +303,12 @@ def _train_one(
                     extra=meta,
                 ),
             )
-    if best_state is not None:
-        net.load_state_dict(best_state)
-        logger.info("PPO seed={} restored epoch {} (valid_sharpe={:.4f})", seed, best_epoch, best_score)
     net.eval()
     return net
 
 
 @torch.no_grad()
-def _predict(net: PPOActorCritic, windows: np.ndarray) -> np.ndarray:
+def _predict(net: GRPOActor, windows: np.ndarray) -> np.ndarray:
     net.eval()
     obs = torch.from_numpy(np.ascontiguousarray(windows, dtype=np.float32))
     out = np.zeros(len(windows), dtype=np.float32)
@@ -443,27 +358,21 @@ def _fold_windows(median: np.ndarray, iqr: np.ndarray, seq_len: int) -> np.ndarr
 
 def _seed_worker(job: dict) -> dict:
     """训练一个 (fold, seed)，返回权重和测试折预测。可在子进程里跑。"""
-    cfg = job["cfg"]
     tr = np.asarray(job["train_idx"], dtype=int)
     te = job["test_idx"]
     win = _fold_windows(job["median"], job["iqr"], int(job["seq_len"]))
-    fit, val = _split_valid(tr, frac=float(cfg.nn_valid_frac), purge=int(cfg.nn_valid_purge))
-    valid = None
-    if val is not None:
-        valid = (win[val], _SHARED["y"][val], _SHARED["lev"][val])
     net = _train_one(
-        win[fit],
-        _SHARED["y"][fit],
-        _SHARED["lev"][fit],
-        _SHARED["vol"][fit],
-        cfg=cfg,
+        win[tr],
+        _SHARED["y"][tr],
+        _SHARED["lev"][tr],
+        _SHARED["vol"][tr],
+        cfg=job["cfg"],
         cost=float(job["cost"]),
         seed=int(job["seed"]),
         y_clip=float(job["y_clip"]),
         ckpt_prefix=job["ckpt_prefix"],
         ckpt_meta=job["ckpt_meta"],
         init_state=job["init_state"],
-        valid=valid,
     )
     pred = None
     if te is not None and len(te):
@@ -646,22 +555,15 @@ def train_fold(
     """Train one PPO seed on a single fold. Pass init_path to warm-start from the previous fold."""
     cfg = settings.strategy
     seq_len = int(cfg.seq_len) if cfg.seq_len else SEQ_LEN
-    cost = cfg.nn_cost_bps / 10_000.0
+    cost = execution_cost_rate(settings)
     y_clip = 0.04
     feats = build_feature_frame(panel)
     y_all = execution_aligned_returns(panel).to_numpy(dtype=np.float64)
     vol_all, lev_all = sizing_series(panel, cfg)
     x_all = feats.to_numpy(dtype=np.float64)
     train_idx = np.asarray(train_idx, dtype=int)
-    fit_idx, val_idx = _split_valid(
-        train_idx, frac=float(cfg.nn_valid_frac), purge=int(cfg.nn_valid_purge)
-    )
-    # 标定只用真正参与拟合的那段，否则验证段的分布会从 median/iqr 漏回训练
-    median, iqr = _fit_scaler(x_all[fit_idx])
+    median, iqr = _fit_scaler(x_all[train_idx])
     win = make_windows(_robust_scale(x_all, median, iqr), seq_len=seq_len)
-    valid = None
-    if val_idx is not None:
-        valid = (win[val_idx], y_all[val_idx], lev_all[val_idx])
     init_state = None
     if init_path is not None:
         blob = torch.load(Path(init_path), map_location="cpu", weights_only=False)
@@ -670,10 +572,10 @@ def train_fold(
             raise ValueError(f"checkpoint has no states: {init_path}")
         init_state = states[0]
     net = _train_one(
-        win[fit_idx],
-        y_all[fit_idx],
-        lev_all[fit_idx],
-        vol_all[fit_idx],
+        win[train_idx],
+        y_all[train_idx],
+        lev_all[train_idx],
+        vol_all[train_idx],
         cfg=cfg,
         cost=cost,
         seed=int(seed),
@@ -681,7 +583,6 @@ def train_fold(
         ckpt_prefix=Path(path) if path is not None else None,
         ckpt_meta={"median": median, "iqr": iqr, "fold_id": int(fold_id)} if path is not None else None,
         init_state=init_state,
-        valid=valid,
     )
     pred_te = None
     if test_idx is not None and len(test_idx):
@@ -690,8 +591,7 @@ def train_fold(
     out = {
         "fold_id": int(fold_id),
         "seed": int(seed),
-        "n_train": int(len(fit_idx)),
-        "n_valid": int(0 if val_idx is None else len(val_idx)),
+        "n_train": int(len(train_idx)),
         "n_test": int(len(test_idx) if test_idx is not None else 0),
         "median": median,
         "iqr": iqr,
@@ -726,8 +626,9 @@ def train_decision_net(
 ) -> TrainResult:
     cfg = settings.strategy
     seq_len = int(cfg.seq_len) if cfg.seq_len else SEQ_LEN
+    train_cost = execution_cost_rate(settings)
     cost = cfg.nn_cost_bps / 10_000.0
-    live_cost = execution_cost_rate(settings)
+    live_cost = train_cost
     horizon = desk_hold_bars(cfg)
     steps_per_year = float(HOURLY_BARS_PER_YEAR)
     y_clip = 0.04
@@ -784,16 +685,13 @@ def train_decision_net(
                 len(te),
                 prev_states[0] is not None,
             )
-            # 与 _seed_worker 里的切法一致，别让验证段进标定
-            median, iqr = _fit_scaler(
-                x_all[_split_valid(tr_h, frac=float(cfg.nn_valid_frac), purge=int(cfg.nn_valid_purge))[0]]
-            )
+            median, iqr = _fit_scaler(x_all[tr_h])
             results = _run_seed_jobs(
                 [
                     {
                         "cfg": cfg,
                         "seq_len": seq_len,
-                        "cost": cost,
+                        "cost": train_cost,
                         "y_clip": y_clip,
                         "median": median,
                         "iqr": iqr,
@@ -837,15 +735,13 @@ def train_decision_net(
         tr_h = valid[valid < prod_end]
         if len(tr_h) < 48:
             tr_h = valid
-        median, iqr = _fit_scaler(
-            x_all[_split_valid(tr_h, frac=float(cfg.nn_valid_frac), purge=int(cfg.nn_valid_purge))[0]]
-        )
+        median, iqr = _fit_scaler(x_all[tr_h])
         prod = _run_seed_jobs(
             [
                 {
                     "cfg": cfg,
                     "seq_len": seq_len,
-                    "cost": cost,
+                    "cost": train_cost,
                     "y_clip": y_clip,
                     "median": median,
                     "iqr": iqr,
@@ -909,19 +805,22 @@ def train_decision_net(
             "min_position": float(cfg.min_position),
             "vol_lookback": int(cfg.vol_lookback),
             "eval_cost_bps": round(live_cost * 10_000.0, 4),
-            "train_cost_bps": float(cfg.nn_cost_bps),
+            "train_cost_bps": round(train_cost * 10_000.0, 4),
         },
         "horizon_hours": horizon,
         "n_folds": fold,
         "n_oos_bars": int(mask.sum()),
         "path": str(path),
         "oos_path": str(oos_path),
-        "label": "hourly_ppo_from_next_open",
+        "label": "hourly_grpo_from_next_open",
         "obs": f"[{seq_len}, {N_FEAT}]",
         "note": (
-            "Walk-forward OOS for PPO actor (greedy), warm-started across folds per seed. "
+            "Walk-forward OOS for GRPO actor (greedy), warm-started across folds per seed. "
             "oos_neural replays the desk contract: nn_smooth EMA stepped once per hold_bars, "
             "min_position gate, position frozen between rebalances, live fee+slippage. "
+            "Training overlay uses the same desk hold window: GRPO samples a group of "
+            "actions at each rebalance, scores each candidate on that frozen window, and "
+            "uses group-relative advantages (no critic). "
             "oos_raw_signal is the unsmoothed every-bar signal at nn_cost_bps and is a "
             "reference only -- the desk never trades it. Primary eval is Sharpe and max "
             "drawdown, not raw return. Position is the decision net only; no TSMOM residual."
@@ -929,7 +828,7 @@ def train_decision_net(
     }
     path.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     logger.info(
-        "PPO walk-forward | obs=[{},{}] desk Sharpe={:.2f} mdd={:.2%} calmar={:.2f} ret={:.2%} "
+        "GRPO walk-forward | obs=[{},{}] desk Sharpe={:.2f} mdd={:.2%} calmar={:.2f} ret={:.2%} "
         "turnover={:.4f} | raw Sharpe={:.2f} turnover={:.4f} | folds={}",
         seq_len,
         N_FEAT,

@@ -39,6 +39,15 @@ E[R²] 抬升，随后的收益被更大的分母除，信号越强、暴露波�
 --------------
 ``dd_inc`` / ``dd_level`` 默认 0：实测下行方差项已经把回撤管住（秩相关 0.90），
 再叠加路径回撤项对排序没有增益（0.899 vs 0.903，略降）。留作可调旋钮。
+
+训练时先走 desk 再计 PnL
+------------------------
+``shape_rewards`` 本身不管换仓频率。PPO 的 rollout 会先把采样动作送进
+``desk_positions``（EMA + ``min_position`` 死区，每 ``rebalance_hours`` 根才成交），
+再用 desk 真正持有的仓位调用 ``bar_pnl``，费率与实盘相同（手续费+滑点）。
+
+否则奖励按每小时 |Δexposure| 扣费，评估却是 8h 冻结：高斯探索的翻仓是确定性
+策略的十几倍，训练信号被自伤换手主导，而那笔费用上线根本不会发生。
 """
 from __future__ import annotations
 
@@ -76,9 +85,10 @@ def shape_rewards(
     dd_level: float = 0.0,
     clip: float = 5.0,
 ) -> np.ndarray:
-    """把 PnL 序列变成 PPO 用的逐步奖励（均值 - 下行方差，可选路径回撤）。
+    """把 PnL 序列变成逐步奖励（均值 - 下行方差，可选路径回撤）。
 
     与 ``env.RewardMachine`` 逐 bar 等价，两者由 ``test_env`` 锁在 1e-6 内。
+    GRPO 在再平衡窗口上对这条序列求和，再做组内标准化。
     """
     pnl = np.asarray(pnl, dtype=np.float64)
     vol_annual = np.asarray(vol_annual, dtype=np.float64)
@@ -99,3 +109,71 @@ def shape_rewards(
     shaped -= float(dd_inc) * deepen + float(dd_level) * depth
 
     return np.clip(shaped, -float(clip), float(clip)).astype(np.float32)
+
+
+def hold_group_rewards(
+    actions: np.ndarray,
+    *,
+    last_unit: float,
+    prev_exp: float,
+    y: np.ndarray,
+    lev: np.ndarray,
+    vol_ann: np.ndarray,
+    cost: float,
+    smooth: float,
+    min_position: float,
+    long_only: bool = False,
+    down_lambda: float = 0.5,
+    dd_inc: float = 0.0,
+    dd_level: float = 0.0,
+    clip: float = 5.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """同一再平衡点上 G 个候选动作的窗口总奖励。
+
+    每个候选先走 ``smooth_unit``（与 desk 相同），然后在窗口内冻结仓位，
+    只在第一根支付换手。返回 ``(reward[G], held[G], ema[G])``。
+    """
+    raw = np.asarray(actions, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    lev = np.asarray(lev, dtype=np.float64).reshape(-1)
+    vol_ann = np.asarray(vol_ann, dtype=np.float64).reshape(-1)
+    if y.shape != lev.shape or y.shape != vol_ann.shape:
+        raise ValueError("y/lev/vol length mismatch")
+    if long_only:
+        raw = np.maximum(raw, 0.0)
+    alpha = min(max(float(smooth), 0.0), 0.95)
+    ema = (1.0 - alpha) * raw + alpha * float(last_unit)
+    floor = max(float(min_position), 0.0)
+    ema = np.where(np.abs(ema) < floor, 0.0, ema)
+    held = np.clip(ema, -1.0, 1.0)
+    if y.size == 0:
+        z = np.zeros(len(raw), dtype=np.float64)
+        return z, held, ema
+    exp = held[:, None] * lev[None, :]
+    dlt = np.zeros_like(exp)
+    dlt[:, 0] = np.abs(exp[:, 0] - float(prev_exp))
+    pnl = exp * y[None, :] - float(cost) * dlt
+    hourly = np.clip(vol_ann / np.sqrt(float(BARS_PER_YEAR)), 1e-6, None)
+    r = np.clip(pnl / hourly[None, :], -_R_VOL_CLIP, _R_VOL_CLIP)
+    down = np.minimum(r, 0.0)
+    shaped = r - float(down_lambda) * down * down
+    if float(dd_inc) or float(dd_level):
+        growth = 1.0 + np.clip(pnl, -_PNL_CLIP, _PNL_CLIP)
+        equity = np.cumprod(growth, axis=1)
+        peak = np.maximum.accumulate(equity, axis=1)
+        depth = (peak - equity) / np.clip(peak, 1e-12, None)
+        deepen = np.maximum(np.diff(depth, axis=1, prepend=0.0), 0.0)
+        shaped = shaped - float(dd_inc) * deepen - float(dd_level) * depth
+    shaped = np.clip(shaped, -float(clip), float(clip))
+    return shaped.sum(axis=1), held, ema
+
+
+def group_advantages(rewards: np.ndarray) -> np.ndarray:
+    """GRPO：组内 (r - mean) / std。全员分数一样时优势为 0。"""
+    r = np.asarray(rewards, dtype=np.float64).reshape(-1)
+    if r.size < 2:
+        return np.zeros_like(r, dtype=np.float32)
+    sd = float(r.std())
+    if sd < 1e-8:
+        return np.zeros_like(r, dtype=np.float32)
+    return ((r - r.mean()) / sd).astype(np.float32)
