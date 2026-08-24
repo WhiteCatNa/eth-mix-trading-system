@@ -72,6 +72,14 @@ def cmd_backtest(args) -> int:
     return 0
 
 
+def cmd_dashboard(args) -> int:
+    """回测成交叠加到 TradingView 图上。只读 reports/，不碰训练、不下单。"""
+    from betatrend.dashboard.server import serve
+
+    serve(host=args.host, port=args.port, report=args.report)
+    return 0
+
+
 def cmd_explore_nn(args) -> int:
     """对着 train.log + 最新 fold ckpt 起 TorchExplorer 看板。不碰训练进程。"""
     settings = _settings(args)
@@ -109,6 +117,8 @@ def cmd_train_nn(args) -> int:
         settings,
         force_demo=args.demo,
         path=P(args.path) if args.path else None,
+        resume=bool(getattr(args, "resume", False)),
+        start_fold=getattr(args, "start_fold", None),
     )
     table = Table(title="ETH decision net — walk-forward OOS")
     table.add_column("metric")
@@ -289,7 +299,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="torch threads inside each training process (0=auto split)",
     )
+    tn.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from the latest complete fold checkpoint (warm-start + replay skipped OOS)",
+    )
+    tn.add_argument(
+        "--start-fold",
+        type=int,
+        default=None,
+        help="0-indexed fold to start training from; overrides auto-detect when set",
+    )
     tn.set_defaults(func=cmd_train_nn)
+
+    dash = sub.add_parser(
+        "dashboard",
+        help="TradingView analysis dashboard for a backtest report (fills + equity)",
+    )
+    dash.add_argument("--host", type=str, default="127.0.0.1")
+    dash.add_argument("--port", type=int, default=8090)
+    dash.add_argument("--report", type=str, default="eval_grpo_fold40")
+    dash.set_defaults(func=cmd_dashboard)
 
     ex = sub.add_parser(
         "explore-nn",

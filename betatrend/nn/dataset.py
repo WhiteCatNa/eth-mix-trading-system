@@ -222,6 +222,19 @@ def make_windows(x: np.ndarray, seq_len: int = SEQ_LEN) -> np.ndarray:
     return np.ascontiguousarray(windows[:, 0])
 
 
+def shuffle_rebalance_index(n: int, hold: int, rng: np.random.Generator) -> np.ndarray:
+    """训练集样本顺序：每隔 hold 根一根再平衡点，打乱先后。
+
+    每个下标 t 仍然对应原来的因果窗口和 y[t : t+hold]，不会把 8h 持有窗拆开，
+    也不会把不同小时拼成一段假路径。n<=hold 时只有一个点，原样返回。
+    """
+    hold = max(int(hold), 1)
+    reb = np.arange(0, int(n), hold, dtype=np.int64)
+    if reb.size <= 1:
+        return reb
+    return rng.permutation(reb)
+
+
 def last_feature_row(panel: pd.DataFrame) -> np.ndarray:
     """最后一行因果特征。截一段足够长的尾巴，让 EMA/滚动窗口尽量贴近训练时的状态。"""
     tail = panel.iloc[-max(TAIL_BARS, 256) :] if len(panel) > TAIL_BARS else panel
